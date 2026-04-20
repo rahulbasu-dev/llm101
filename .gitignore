@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Training artefacts (regenerable)
+checkpoints/
+tokenizer.json
+data/
+attention_plots/
+teaching_plots/
+teaching_plots_smoke/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project-specific
+reference/
+files.zip
+*.pt
+*.bin
+*.ckpt
+
+# Logs
+*.log
