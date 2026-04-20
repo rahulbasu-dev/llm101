@@ -110,6 +110,13 @@ do_benchmark() {
     python3 generate.py --benchmark "$@"
 }
 
+# ── Test (pytest suite on mock data, CPU-only) ──────────────
+do_test() {
+    source .venv/bin/activate 2>/dev/null || true
+    echo -e "${GREEN}Running test suite...${NC}"
+    PYTHONIOENCODING=utf-8 python3 -m pytest tests/ "$@"
+}
+
 # ── Verify (quick shape test without training) ──────────────
 do_verify() {
     source .venv/bin/activate 2>/dev/null || true
@@ -130,6 +137,7 @@ case "${1:-help}" in
     visualise)  shift; do_visualise "$@" ;;
     teach)      shift; do_teach "$@" ;;
     benchmark)  shift; do_benchmark "$@" ;;
+    test)       shift; do_test "$@" ;;
     verify)     do_verify ;;
     *)
         echo "Usage: bash run.sh <command>"
@@ -142,6 +150,7 @@ case "${1:-help}" in
         echo "  visualise  Generate attention heatmaps (for webinar slides)"
         echo "  teach      Generate 16-slide step-by-step forward-pass walkthrough"
         echo "  benchmark  Compare generate() vs generate_fast() (KV-cache speedup)"
+        echo "  test       Run pytest suite on mock data (CPU, no training data needed)"
         echo
         echo "Quick start:"
         echo "  bash run.sh setup"

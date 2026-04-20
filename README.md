@@ -11,30 +11,126 @@ Aligned with Sebastian Raschka's
 
 ## Architecture
 
-```
-Token IDs ──→ Embedding ──→ [TransformerBlock × 6] ──→ RMSNorm ──→ LM Head ──→ Logits
-                                    │
-                         ┌──────────┴──────────┐
-                         │   TransformerBlock   │
-                         │                      │
-                         │  RMSNorm             │
-                         │  ↓                   │
-                         │  Multi-Head Attention │ ← RoPE, Causal Mask
-                         │  ↓ + residual        │
-                         │  RMSNorm             │
-                         │  ↓                   │
-                         │  SwiGLU FFN          │
-                         │  ↓ + residual        │
-                         └──────────────────────┘
+### 1. End-to-end pipeline
+
+```mermaid
+flowchart TD
+    Corpus["data/corpus.txt<br/>(raw UTF-8)"] -->|BPE train| Tok["tokenizer.json<br/>(~4k tokens)"]
+    Tok -->|encode| Toks["tokens: List[int]"]
+    Toks -->|sequential<br/>90 / 10 split| TrT["train_tokens"]
+    Toks --> VaT["val_tokens"]
+    TrT -->|"sliding windows<br/>stride = seq_len/2"| TrDS["TextDataset<br/>(input, target)"]
+    VaT --> VaDS["TextDataset"]
+    TrDS -->|batch| Model["NanoLLM.forward<br/>+ backward"]
+    VaDS -->|model.eval| Model
+    Model -->|"cross_entropy"| Loss[loss]
+    Loss -->|"AdamW + warmup<br/>+ cosine + bf16 + clip"| Step["optimizer step"]
+    Step -.->|per epoch| BestCk["checkpoints/best.pt<br/>(lowest val loss)"]
+    Step -.->|end of run| Curve["checkpoints/loss_curve.png"]
 ```
 
-**Design choices match modern LLMs (LLaMA/Mistral/Qwen):**
-- RMSNorm (not LayerNorm)
-- RoPE (not sinusoidal or learned positions)
-- SwiGLU activation (not ReLU/GELU)
-- Pre-Norm (not Post-Norm)
-- Weight tying (embedding ↔ lm_head)
-- Combined QKV projection
+### 2. Model internals — one forward pass
+
+```
+idx : (B, T)                                                     [input token IDs]
+  │
+  ▼
+token_emb (vocab→d_model)  ──── weight-tied with lm_head ────┐
+  │                                                           │
+  │  emb_dropout                                              │
+  ▼                                                           │
+x : (B, T, d_model=384)                                       │
+  │                                                           │
+  ├──────────────────── × n_layers=6 ────────────────────┐    │
+  │ ┌────────────────────── TransformerBlock ──────────┐ │    │
+  │ │                                                  │ │    │
+  │ │  ┌── RMSNorm(attn_norm) ──┐                     │ │    │
+  │ │  │                         │                     │ │    │
+  │ │  ▼                         │                     │ │    │
+  │ │  CausalSelfAttention       │                     │ │    │
+  │ │  │                         │                     │ │    │
+  │ │  │  qkv_proj  →  Q,K,V : (B, nh=6, T, d_head=64) │    │
+  │ │  │  RoPE(Q), RoPE(K)  at start_pos (see §3)      │    │
+  │ │  │  scores = Q·Kᵀ / √d_head                      │    │
+  │ │  │  masked_fill(upper triangle = −∞)  [prefill]  │    │
+  │ │  │  softmax → attn_weights                       │    │
+  │ │  │  out = attn_weights · V                       │    │
+  │ │  │  out_proj + resid_dropout                     │    │
+  │ │  ▼                         │                     │ │    │
+  │ │  + x   ◄─── residual ──────┘                     │ │    │
+  │ │  │                                                 │ │    │
+  │ │  │  ┌── RMSNorm(ffn_norm) ──┐                     │ │    │
+  │ │  │  │                        │                     │ │    │
+  │ │  ▼  ▼                        │                     │ │    │
+  │ │  FeedForward (SwiGLU)        │                     │ │    │
+  │ │  │   silu(gate_proj(x)) ⊙ up_proj(x)  →  down_proj │    │
+  │ │  ▼                            │                     │ │    │
+  │ │  + x   ◄─── residual ─────────┘                     │ │    │
+  │ └──────────────────────────────────────────────────┘ │    │
+  │                                                       │    │
+  └───────────────────────────────────────────────────────┘    │
+  │                                                             │
+  ▼                                                             │
+norm_f (RMSNorm)                                                │
+  │                                                             │
+  ▼                                                             │
+lm_head ◄──────── shared weight ─────────────────────────────────┘
+  │
+  ▼
+logits : (B, T, vocab_size)        [training]
+logits : (B, vocab_size)           [inference — last position only]
+```
+
+### 3. KV-cache decoding (`generate_fast`)
+
+Reference `generate()` reprocesses the whole context each step.
+`generate_fast()` caches K,V so the decode step is O(total_len) not O(total_len²).
+
+```
+┌──────────────────────────── PREFILL (T = prompt_len, past_kv = None) ───────────┐
+│                                                                                  │
+│    prompt ──► model(idx=prompt, past_kv=None) ──► (logits, cache₀)              │
+│                                                                                  │
+│      cache₀ = [(K_layer0, V_layer0), …, (K_layer5, V_layer5)]                    │
+│                 each shape (B, nh, T, d_head)                                    │
+│                 causal mask IS applied here                                      │
+│                 RoPE uses start_pos = 0                                          │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+             sample_next(logits)  ──►  next_token : (B, 1)
+                                       │
+┌──────────────────────────────────────▼───────────────────────────────────────────┐
+│                                DECODE STEP k (T = 1)                             │
+│                                                                                  │
+│    next_token ──► model(idx=next_token, past_kv=cacheₖ)                          │
+│       │                                                                          │
+│       ├─ Q,K,V for the single new token :  (B, nh, 1, d_head)                    │
+│       ├─ RoPE uses start_pos = past_len                     ← key correctness!  │
+│       ├─ concat(cacheₖ.K, new_K)  →  (B, nh, past_len+1, d_head)                 │
+│       ├─ concat(cacheₖ.V, new_V)  →  (B, nh, past_len+1, d_head)                 │
+│       ├─ NO causal mask  (single query is always newest position)                │
+│       └─ attention: (B, nh, 1, past_len+1) @ V                                   │
+│                                                                                  │
+│       ──► (logits, cacheₖ₊₁)                                                     │
+│                                                                                  │
+│    loop:  sample_next ──► next_token ──► repeat until max_new_tokens or limit    │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The equivalence `max |Δlogit| < 1e-4` between the two paths is verified by
+`test_model.py::test_kv_cache_matches_full_pass` and the multi-step variant.
+
+### Design choices (modern LLM stack)
+
+| Component | Choice | Alternative (classical) |
+|---|---|---|
+| Normalization | **RMSNorm** | LayerNorm |
+| Positional | **RoPE** | Sinusoidal / learned |
+| FFN activation | **SwiGLU** | ReLU / GELU |
+| Norm placement | **Pre-Norm** | Post-Norm |
+| Output projection | **Weight-tied** with `token_emb` | Separate weights |
+| Attention projection | **Combined QKV** | Separate Q, K, V matmuls |
 
 **~15M parameters** — trains in 5–15 minutes on RTX 4080.
 
@@ -61,6 +157,9 @@ bash run.sh teach
 
 # 7. Attention heatmaps + rollout
 bash run.sh visualise
+
+# 8. Run the test suite (pytest, CPU-only, no real data needed)
+bash run.sh test
 ```
 
 ## Files
@@ -75,7 +174,8 @@ bash run.sh visualise
 | `generate.py` | Interactive generation with top-k + nucleus sampling |
 | `visualise.py` | Attention heatmaps and rollout analysis |
 | `teach.py` | **16-slide forward-pass walkthrough** (tokenization → sampling) |
-| `run.sh` | One-command setup/train/generate/visualise/teach/benchmark |
+| `tests/` | 42-test pytest suite (CPU-only, mock corpus, ~4s to run) |
+| `run.sh` | One-command setup/train/generate/visualise/teach/benchmark/test |
 | `REFERENCES.md` | Slide-to-Raschka-chapter cross-walk |
 | `docs/superpowers/specs/` | Design docs for enhancements |
 
