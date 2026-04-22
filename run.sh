@@ -1,5 +1,5 @@
 #!/bin/bash
-# NanoLLM — Setup & Run Script
+# LLM101 — Setup & Run Script
 # Run: bash run.sh [setup|train|generate|visualise]
 
 set -e
@@ -15,7 +15,7 @@ NC='\033[0m'
 banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════╗"
-    echo "║              NanoLLM — Build Your LLM            ║"
+    echo "║              LLM101 — Build Your LLM             ║"
     echo "║     From Scratch on RTX 4080 (12GB VRAM)        ║"
     echo "╚══════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -23,26 +23,56 @@ banner() {
 
 # ── Setup ───────────────────────────────────────────────────
 do_setup() {
-    echo -e "${GREEN}[1/4] Creating Python venv...${NC}"
-    if [ ! -d ".venv" ]; then
-        python3 -m venv .venv
+    echo -e "${GREEN}[1/4] Python environment...${NC}"
+
+    # Remove any partial / broken venv from a prior failed run (no activate
+    # script means ensurepip failed and the directory is useless).
+    if [ -d ".venv" ] && [ ! -f ".venv/bin/activate" ]; then
+        echo -e "${YELLOW}  Removing broken .venv from a prior failed setup.${NC}"
+        rm -rf .venv
     fi
-    source .venv/bin/activate
+
+    # Try to create a venv. If it fails (missing python3-venv on
+    # Debian/Ubuntu WSL, or similar), fall back to the system interpreter.
+    if [ ! -d ".venv" ]; then
+        if python3 -m venv .venv 2>/tmp/llm101_venv_err; then
+            echo -e "${GREEN}  Created .venv${NC}"
+        else
+            echo -e "${YELLOW}  Could not create .venv — falling back to system Python.${NC}"
+            echo -e "${YELLOW}  Original error:${NC}"
+            sed 's/^/    /' /tmp/llm101_venv_err
+            echo
+            echo -e "${YELLOW}  To fix (if you want a venv):${NC}"
+            echo -e "${YELLOW}    Debian/Ubuntu (inside WSL2): apt install python3-venv${NC}"
+            echo -e "${YELLOW}    Then re-run: bash run.sh setup${NC}"
+            rm -rf .venv 2>/dev/null
+        fi
+    fi
+
+    # Activate the venv if it's usable; otherwise use system Python.
+    if [ -f ".venv/bin/activate" ]; then
+        source .venv/bin/activate
+        PIP="pip"
+        PY="python3"
+    else
+        PIP="python3 -m pip"
+        PY="python3"
+    fi
 
     echo -e "${GREEN}[2/4] Installing CUDA-enabled PyTorch (cu121) + deps...${NC}"
-    pip install --upgrade pip -q
+    $PIP install --upgrade pip -q
     # CUDA-enabled build (cu121 — works with any RTX 3xxx/4xxx/5xxx GPU).
-    # NanoLLM requires CUDA; see config.require_cuda().
-    pip install --upgrade torch torchvision torchaudio \
+    # LLM101 requires CUDA; see config.require_cuda().
+    $PIP install --upgrade torch torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu121 -q
-    pip install matplotlib numpy tqdm pytest -q
+    $PIP install matplotlib numpy tqdm pytest -q
 
     echo -e "${GREEN}[3/4] Verifying GPU...${NC}"
     python3 -c "
 import sys, torch
 if '+cpu' in torch.__version__:
     print('  ✗ ERROR: CPU-only torch installed (got ' + torch.__version__ + ')')
-    print('  ✗ NanoLLM requires CUDA. Run: bash run.sh setup again.')
+    print('  ✗ LLM101 requires CUDA. Run: bash run.sh setup again.')
     sys.exit(1)
 if not torch.cuda.is_available():
     print('  ✗ ERROR: CUDA torch installed but no GPU detected.')
@@ -82,7 +112,7 @@ print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
 # ── Train ───────────────────────────────────────────────────
 do_train() {
     source .venv/bin/activate 2>/dev/null || true
-    echo -e "${GREEN}Starting NanoLLM training...${NC}"
+    echo -e "${GREEN}Starting LLM101 training...${NC}"
     python3 train.py
 }
 
@@ -133,7 +163,7 @@ do_ui() {
         echo -e "${YELLOW}Installing/upgrading gradio to 5.x...${NC}"
         pip install "gradio>=5,<6" -q
     fi
-    echo -e "${GREEN}Launching NanoLLM Webinar Console on http://127.0.0.1:7860 ...${NC}"
+    echo -e "${GREEN}Launching LLM101 Webinar Console on http://127.0.0.1:7860 ...${NC}"
     echo -e "${YELLOW}Tip: add --share for a public URL (webinar mode)${NC}"
     PYTHONIOENCODING=utf-8 python3 app.py "$@"
 }
@@ -167,7 +197,7 @@ case "${1:-help}" in
         echo "Commands:"
         echo "  setup      Install dependencies + download training data"
         echo "  verify     Quick test — verify model shapes and tokenizer"
-        echo "  train      Train the NanoLLM (takes ~5-15 min on RTX 4080)"
+        echo "  train      Train the LLM101 (takes ~5-15 min on RTX 4080)"
         echo "  generate   Interactive text generation from trained model"
         echo "  visualise  Generate attention heatmaps (for webinar slides)"
         echo "  teach      Generate 16-slide step-by-step forward-pass walkthrough"

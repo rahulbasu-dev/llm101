@@ -1,4 +1,4 @@
-"""NanoLLM — A complete GPT-style Transformer language model built from scratch.
+"""LLM101 — A complete GPT-style Transformer language model built from scratch.
 
 Architecture choices mirror modern LLMs (LLaMA / Mistral / Qwen):
   • RMSNorm (not LayerNorm)
@@ -307,7 +307,7 @@ class NanoLLM(nn.Module):
         # Weight-tied params counted once
         n_params -= self.token_emb.weight.numel()
         n_params += self.token_emb.weight.numel()
-        print(f"NanoLLM initialised: {n_params:,} parameters ({n_params/1e6:.2f}M)")
+        print(f"LLM101 initialised: {n_params:,} parameters ({n_params/1e6:.2f}M)")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

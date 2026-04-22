@@ -1,4 +1,4 @@
-"""Interactive text generation with a trained NanoLLM checkpoint.
+"""Interactive text generation with a trained LLM101 checkpoint.
 
 Usage:
     python generate.py                          # Interactive, no KV cache
@@ -119,7 +119,7 @@ def run_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoLLM Text Generation")
+    parser = argparse.ArgumentParser(description="LLM101 Text Generation")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt",
                         help="Path to model checkpoint")
     parser.add_argument("--max_tokens", type=int, default=200,
@@ -148,7 +148,7 @@ def main():
     mode = "KV-cached (fast)" if args.fast else "no cache (reference)"
     print()
     print("=" * 50)
-    print(f"NanoLLM Interactive Generation [{mode}]")
+    print(f"LLM101 Interactive Generation [{mode}]")
     print(f"Temperature: {args.temperature}  Top-k: {args.top_k}  Top-p: {args.top_p}")
     print("Type a prompt and press Enter. Type 'quit' to exit.")
     print("=" * 50)

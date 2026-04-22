@@ -1,4 +1,4 @@
-"""Visualise attention patterns from a trained NanoLLM.
+"""Visualise attention patterns from a trained LLM101.
 
 Generates:
   1. Attention heatmaps per layer/head (which tokens attend to which)
@@ -207,7 +207,7 @@ def visualise(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoLLM Attention Visualisation")
+    parser = argparse.ArgumentParser(description="LLM101 Attention Visualisation")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--text", default="To be or not to be that is the question")
     parser.add_argument("--output_dir", default="attention_plots")

@@ -346,7 +346,7 @@ def draw_config_summary(path):
     if os.path.exists(path):
         return
     fig, ax = plt.subplots(figsize=(10, 4.5))
-    _header(ax, "NanoLLMConfig — the knobs",
+    _header(ax, "LLM101 — the hyperparameters (NanoLLMConfig dataclass)",
             "One dataclass, every tunable. Derived values as @property.")
 
     names = ["d_model", "n_layers", "n_heads", "d_ff",

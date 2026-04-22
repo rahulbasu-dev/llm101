@@ -1,4 +1,4 @@
-"""NanoLLM Training Loop.
+"""LLM101 Training Loop.
 
 Features:
   • bf16 mixed-precision (RTX 4080 supports bf16 natively)
@@ -97,7 +97,7 @@ def save_loss_curve(train_history, epoch_history, path):
     ax.set_xlabel("Global step", fontsize=11)
     ax.set_ylabel("Cross-entropy loss (log scale)", fontsize=11)
     ax.set_yscale("log")
-    ax.set_title("NanoLLM training curve", fontsize=13, fontweight="bold")
+    ax.set_title("LLM101 training curve", fontsize=13, fontweight="bold")
     ax.legend(loc="upper right", framealpha=0.9)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
@@ -113,7 +113,7 @@ def train():
     # Hard-require CUDA: training the full config on CPU takes hours.
     device = require_cuda()
     print("=" * 60)
-    print("NanoLLM Training")
+    print("LLM101 Training")
     print("=" * 60)
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(0)

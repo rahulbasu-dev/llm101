@@ -1,4 +1,4 @@
-"""NanoLLM — Webinar Console (Gradio UI).
+"""LLM101 — Webinar Console (Gradio UI).
 
 A single browser app with four tabs:
   1. Generate      — live token streaming; toggle KV cache on/off to see speed
@@ -408,7 +408,7 @@ _BUILD_STEPS: list[tuple[str, str, str | None]] = [
         "Start here, not at `model.py`. A single dataclass owning every tunable "
         "keeps the rest of the code uncluttered and reproducibility mechanical.\n\n"
         "**Non-obvious choice:** `vocab_size` starts at **0**. Every script that "
-        "builds a `NanoLLM` must set `config.vocab_size = tokenizer.vocab_size` "
+        "builds the model must set `config.vocab_size = tokenizer.vocab_size` "
         "*before* instantiation. This avoids hardcoding a vocab size and keeps "
         "the tokenizer and model coupled through a single variable.\n\n"
         "Derived values live in `@property`, with assertions that catch "
@@ -691,10 +691,10 @@ def build_ui() -> gr.Blocks:
     n_heads = _CONFIG.n_heads if _CONFIG is not None else 6
     max_seq = _CONFIG.max_seq_len if _CONFIG is not None else 256
 
-    with gr.Blocks(title="NanoLLM — Webinar Console",
+    with gr.Blocks(title="LLM101 — Webinar Console",
                    theme=gr.themes.Soft(primary_hue="blue")) as demo:
         gr.Markdown(
-            "# NanoLLM — Webinar Console\n"
+            "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
             "Four tabs: **Generate** (live streaming), **Teach** (16 explanatory slides), "
             "**Attention** (per-head heatmaps), **Benchmark** (KV-cache speedup)."
@@ -920,7 +920,7 @@ def find_free_port(start_port: int, host: str = "127.0.0.1",
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoLLM — Gradio webinar console")
+    parser = argparse.ArgumentParser(description="LLM101 — Gradio webinar console")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--port", type=int, default=7860,
                         help="Preferred starting port (will auto-fallback if busy)")
@@ -930,7 +930,7 @@ def main():
                         help="Bind address (use 0.0.0.0 to expose on LAN)")
     args = parser.parse_args()
 
-    print("NanoLLM Webinar Console — starting...")
+    print("LLM101 Webinar Console — starting...")
     _load_model(args.checkpoint)
     print(f"  {_STATUS}")
 

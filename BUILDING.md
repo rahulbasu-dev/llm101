@@ -1,4 +1,4 @@
-# Building NanoLLM — Step by Step
+# Building LLM101 — Step by Step
 
 A chronicle of how this project actually came together, in the order a new builder
 should follow. Unlike `nanollm-guide.md` (which is the *theory*, RNN → Transformer)

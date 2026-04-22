@@ -1,4 +1,4 @@
-# References — What NanoLLM Covers From the Book
+# References — What LLM101 Covers From the Book
 
 This project follows the pedagogy of **Sebastian Raschka's
 ["Build a Large Language Model (From Scratch)"](https://github.com/rasbt/LLMs-from-scratch)**
@@ -29,7 +29,7 @@ Each teach.py slide maps to a chapter of the book:
 
 ## Modern substitutions (and why)
 
-| Book uses (GPT-2 era) | NanoLLM uses (LLaMA era) | Rationale |
+| Book uses (GPT-2 era) | LLM101 uses (LLaMA era) | Rationale |
 |-----------------------|--------------------------|-----------|
 | LayerNorm             | **RMSNorm**              | Fewer ops, same stability — adopted by LLaMA / Mistral / Qwen |
 | Learned positional embeddings | **RoPE** (Rotary) | Better length generalization; relative position for free |
@@ -41,7 +41,7 @@ Slides 09 and 12 demonstrate the substitution visually. Chapter 4 of the book
 
 ## Topics from the book intentionally NOT covered
 
-The book goes on to fine-tuning (chapters 6–7). NanoLLM stops at pre-training
+The book goes on to fine-tuning (chapters 6–7). LLM101 stops at pre-training
 because the webinar target is understanding the transformer, not production
 fine-tuning. The pre-training loop (Ch 5.2) is covered by `train.py` with
 additions not in the book: bf16 mixed precision, val split with best-on-val
@@ -49,7 +49,7 @@ checkpointing, and the loss-curve PNG.
 
 ## Beyond the book
 
-Two elements the book doesn't visualize, but NanoLLM does:
+Two elements the book doesn't visualize, but LLM101 does:
 
 - **KV cache** — `generate_fast()` demonstrates the inference optimization that
   makes modern LLMs deploy-able. The `benchmark` command shows the speedup.

@@ -1,4 +1,4 @@
-# NanoLLM — Build a Language Model From Scratch
+# LLM101 — Build a Language Model From Scratch
 
 A complete, annotated GPT-style Transformer language model in ~800 lines of PyTorch.
 Every component is written from scratch with detailed comments explaining **what** and **why**.
@@ -232,7 +232,7 @@ Launch with `bash run.sh ui`. Without a trained checkpoint it uses random weight
 5. **Generation samples** (`run.sh generate --fast`) — interactive demo with
    KV cache live
 6. **Attention heatmaps** (`run.sh visualise`) — per-head patterns + rollout
-7. **Scaling table** — compare NanoLLM to LLaMA-2 7B to GPT-4
+7. **Scaling table** — compare LLM101 to LLaMA-2 7B to GPT-4
 
 ## New features (beyond Raschka)
 

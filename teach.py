@@ -1,4 +1,4 @@
-"""NanoLLM — Step-by-step forward-pass walkthrough for students.
+"""LLM101 — Step-by-step forward-pass walkthrough for students.
 
 Produces a numbered sequence of annotated PNG "slides" in teaching_plots/
 that walk through what happens when a single prompt passes through the model.
@@ -941,7 +941,7 @@ def teach(checkpoint_path, text, output_dir, layer, head, query_pos,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoLLM — step-by-step teaching slides")
+    parser = argparse.ArgumentParser(description="LLM101 — step-by-step teaching slides")
     parser.add_argument("--text", default="The cat sat on the")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--output_dir", default="teaching_plots")

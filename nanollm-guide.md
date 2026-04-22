@@ -1,5 +1,5 @@
 # Building Your Own LLM From Scratch — Complete Guide
-## From RNNs to Transformers to a Working NanoLLM on RTX 4080 (12GB)
+## From RNNs to Transformers to a Working LLM101 on RTX 4080 (12GB)
 
 **Goal:** Webinar-ready understanding + working code in 7 days  
 **Hardware:** NVIDIA RTX 4080 12GB VRAM, Windows + WSL2, Ollama already running  
