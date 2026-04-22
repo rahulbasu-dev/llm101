@@ -43,6 +43,7 @@ from teach import (
     slide_16_param_breakdown,
 )
 from visualise import AttentionCapture, compute_attention_rollout, plot_attention_heatmap
+import build_viz
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -383,6 +384,292 @@ def run_bench(prompt, n_tokens):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Tab 5: Build Steps (interactive tutorial)
+# ═══════════════════════════════════════════════════════════════
+
+# Step content: (title, body markdown, image-key or None)
+# image-key resolves via build_viz.render_all() for structural diagrams,
+# or via a small helper for the teach.py reused slides (step 2, 6, 8).
+
+_BUILD_STEPS: list[tuple[str, str, str | None]] = [
+    (
+        "1 · Pin the hyperparameters  ·  `config.py`",
+        "Start here, not at `model.py`. A single dataclass owning every tunable "
+        "keeps the rest of the code uncluttered and reproducibility mechanical.\n\n"
+        "**Non-obvious choice:** `vocab_size` starts at **0**. Every script that "
+        "builds a `NanoLLM` must set `config.vocab_size = tokenizer.vocab_size` "
+        "*before* instantiation. This avoids hardcoding a vocab size and keeps "
+        "the tokenizer and model coupled through a single variable.\n\n"
+        "Derived values live in `@property`, with assertions that catch "
+        "misconfiguration at access time rather than during a forward pass.",
+        "config",
+    ),
+    (
+        "2 · Byte-level BPE tokenizer  ·  `tokenizer.py`",
+        "BPE from scratch in ~200 lines. Byte-level means the base vocab is "
+        "always 256 (every possible byte), so any UTF-8 text round-trips "
+        "losslessly — no `<UNK>` explosion on new characters.\n\n"
+        "**Vocabulary layout:**\n"
+        "```\n"
+        "0-3     : <PAD>, <BOS>, <EOS>, <UNK>    (4 specials)\n"
+        "4-259   : raw bytes 0x00-0xFF           (256 base)\n"
+        "260+    : learned BPE merges\n"
+        "```\n\n"
+        "**Gotcha — test corpus variety:** A corpus of `\"hello world. \" * 100` "
+        "collapses into a **single** token after ~10 merges. BPE tests need real "
+        "variation. The visual below shows one prompt tokenized (this is slide 01 "
+        "of the Teach tab, reused here).",
+        "teach_01",  # rendered from teach.py on demand
+    ),
+    (
+        "3 · Sliding-window dataset  ·  `dataset.py`",
+        "Turns a token stream into `(input_ids, targets)` pairs where "
+        "`targets = input_ids shifted +1`. This is the core causal-LM "
+        "training invariant.\n\n"
+        "**Default stride is `seq_len // 2`** (50% overlap). Non-overlap is a "
+        "cleaner evaluation metric but halves the sample count; the overlap is "
+        "slightly redundant for training but improves boundary next-token "
+        "prediction.\n\n"
+        "Tested by an invariant: `target[:-1] == input[1:]` — "
+        "`tests/test_dataset.py::test_target_is_input_shifted_by_one`.",
+        "sliding",
+    ),
+    (
+        "4 · The Transformer block  ·  `model.py`",
+        "Build bottom-up: **RMSNorm → RoPE → Attention → SwiGLU → Block**. "
+        "Each component has a test in `tests/test_model.py`.\n\n"
+        "**Pre-Norm** (normalize *before* the sublayer, add residual *after*) "
+        "is what keeps deep stacks stable without a learning-rate-warmup "
+        "knife-edge. Modern LLMs all use this pattern.\n\n"
+        "**Weight tying:** `self.lm_head.weight = self.token_emb.weight` — "
+        "not a copy, the SAME tensor. Test with `is` not `torch.equal`.\n\n"
+        "**GPT-2 residual-projection init:** scale by `1/√(2·n_layers)` to keep "
+        "activation variance stable as depth grows. Easy to miss; preserve it.",
+        "block",
+    ),
+    (
+        "5 · Training loop  ·  `train.py`",
+        "The ingredients, in descending order of impact:\n\n"
+        "1. **bf16 mixed precision** on Ampere+ — 2× speedup, basically free\n"
+        "2. **AdamW** with weight-decay groups — decay on 2D weights only\n"
+        "3. **Linear warmup → cosine decay** to 10% of peak LR (200 warmup steps)\n"
+        "4. **Grad clip 1.0** — cheap insurance against loss spikes\n"
+        "5. **Val split is sequential 90/10** — random split leaks via overlapping "
+        "windows\n"
+        "6. **\"Best\" checkpoint on *val* loss**, not train loss. Otherwise the "
+        "\"best\" is usually right before overfitting starts.\n\n"
+        "At the end, we dump `loss_curve.png` — students can SEE the gap between "
+        "train and val open up. That IS overfitting.",
+        "training",
+    ),
+    (
+        "6 · Autoregressive generation (naïve)",
+        "Forward the full context, sample from last-position logits, append, "
+        "repeat. The sampling filter (temperature → top-k → top-p) is shared "
+        "between `generate()`, `generate_fast()`, and `teach.py`'s sampling "
+        "rollout — one source of truth, `_sample_from_logits()`.\n\n"
+        "The `scatter` at the end of top-p looks fragile but is correct: "
+        "`sorted_idx` is a permutation over ALL vocab positions, so every slot "
+        "is written.\n\n"
+        "**This is slide 11 of the Teach tab** — watch 10 decode steps with the "
+        "top-5 candidates at each step and which one was sampled.",
+        "teach_11",  # sampling rollout
+    ),
+    (
+        "7 · KV cache  ·  `generate_fast()`",
+        "Without a cache, every decode step recomputes Q, K, V for the entire "
+        "context. With a cache, you keep K, V from prior steps and only compute "
+        "them for the **new token**. Each step becomes "
+        "`O(total_len)` instead of `O(total_len²)`.\n\n"
+        "**Two invariants that are easy to miss:**\n\n"
+        "- **RoPE offset.** The new token's RoPE angle must match what it would "
+        "have been in a single-pass forward — so `start_pos = past_len`, not 0.\n"
+        "- **Causal mask.** Applied during **prefill** (T>1), skipped during "
+        "**decode** (T=1).\n\n"
+        "**Correctness test:** `prefill(prompt)` then 1-step decode must match "
+        "a full forward on `prompt`. `test_kv_cache_matches_full_pass` asserts "
+        "`max |Δlogit| < 1e-4`. This is the test that catches a broken RoPE "
+        "offset.\n\n"
+        "**Keep both paths.** Deleting `generate()` loses the pedagogical A/B "
+        "comparison. The Benchmark tab literally shows both numbers side by side.",
+        "kv_cache",
+    ),
+    (
+        "8 · Teaching hooks  ·  `teach.py`",
+        "Pattern worth stealing: capture intermediate tensors via "
+        "**forward hooks** without modifying `model.py` at all.\n\n"
+        "```python\n"
+        "block.attn.register_forward_pre_hook(attn_hook)\n"
+        "def attn_hook(module, inp):\n"
+        "    x = inp[0]\n"
+        "    # Recompute Q, K, V, scores, weights from x\n"
+        "    store['attn_weights'] = ...\n"
+        "```\n\n"
+        "The alternative — sprinkling `return_attention=True` kwargs through "
+        "the production code — poisons `model.py`. Hooks keep teaching "
+        "instrumentation strictly orthogonal to the model.\n\n"
+        "**Re-render on-the-fly** (don't cache PNGs to disk and serve those): "
+        "the whole point is that changing the prompt flips the attention. "
+        "That's why this UI calls `teach.py` functions directly.\n\n"
+        "The visual below is slide 08 — all attention heads of one layer "
+        "side-by-side, each learning a different pattern.",
+        "teach_08",  # all heads
+    ),
+    (
+        "9 · Attention visualisation  ·  `visualise.py`",
+        "Two things worth rendering:\n\n"
+        "1. **Per-head heatmap** — `attn_weights[layer][0, head]`, shape `(T, T)`, "
+        "viridis colormap, row = query, column = key.\n"
+        "2. **Attention rollout** (Abnar & Zuidema 2020) — multiply attention "
+        "matrices across all layers to see *effective* attention flow. More "
+        "interpretable than any single layer.\n\n"
+        "Both are in the **Attention** tab. Pick any prompt + layer + head to "
+        "see the heatmap live.",
+        None,  # use the Attention tab directly
+    ),
+    (
+        "10 · Gradio web UI  ·  `app.py`  (this page!)",
+        "A single browser app as the webinar entrypoint. All handlers import "
+        "and call existing functions from `teach.py` and `visualise.py` — no "
+        "logic re-implemented.\n\n"
+        "**Two Gradio patterns worth learning:**\n\n"
+        "1. **Streaming via `yield`.** A generator handler gives you per-token "
+        "typewriter output for free.\n"
+        "2. **Module-level singletons + `monkeypatch` for tests.** Load the "
+        "model once at startup; tests inject a tiny model via "
+        "`monkeypatch.setattr(app, \"_MODEL\", tiny_model)`. No I/O, "
+        "sub-second UI smoke tests.\n\n"
+        "**Version pin:** `gradio>=5,<6`. 4.44.x has a schema-introspection "
+        "bug that crashes `launch()`. Upgrade fixes it.",
+        "ui_layout",
+    ),
+    (
+        "11 · Test suite  ·  `tests/`",
+        "48 tests (42 unit + 6 UI smoke), CPU-only, ~18 s end-to-end. The "
+        "highest-value tests are the ones that guard **invariants** rather "
+        "than shapes:\n\n"
+        "- `test_kv_cache_matches_full_pass` → RoPE `start_pos` invariant\n"
+        "- `test_causal_mask_no_future_leakage` → perturbing token T-1 "
+        "leaves earlier logits unchanged\n"
+        "- `test_weight_tying` → `is`-check: `lm_head.weight` and "
+        "`token_emb.weight` are the SAME tensor\n"
+        "- `test_training_step_reduces_loss_on_tiny_overfit` → end-to-end "
+        "backward/optimizer actually moves parameters\n\n"
+        "Invariant tests survive refactoring. Shape tests get rewritten every "
+        "time somebody touches the code.",
+        "test_matrix",
+    ),
+    (
+        "12 · Ship it  ·  `run.sh`",
+        "Commands unified through one bash dispatcher:\n\n"
+        "```bash\n"
+        "bash run.sh setup       # venv + torch + TinyShakespeare\n"
+        "bash run.sh verify      # model.py __main__ sanity check\n"
+        "bash run.sh train       # full training (~5-15 min on RTX 4080)\n"
+        "bash run.sh generate --fast\n"
+        "bash run.sh benchmark   # generate vs generate_fast\n"
+        "bash run.sh teach       # 16 static PNGs\n"
+        "bash run.sh visualise   # attention heatmaps + rollout\n"
+        "bash run.sh ui          # this console\n"
+        "bash run.sh test        # pytest suite\n"
+        "```\n\n"
+        "Explicit subcommands > magic auto-detection. "
+        "A new user running `bash run.sh` with no arg gets a helpful usage message.\n\n"
+        "**Further reading:** `BUILDING.md` (this page, as markdown), "
+        "`REFERENCES.md` (slide ↔ Raschka book), "
+        "`nanollm-guide.md` (RNN → Transformer theory).",
+        None,
+    ),
+]
+
+
+_BUILD_IMG_CACHE: dict[str, str] = {}
+
+
+def _render_build_image(key: str) -> str | None:
+    """Resolve a step's image-key to a PNG path. Idempotent & cached."""
+    if key is None:
+        return None
+    if key in _BUILD_IMG_CACHE:
+        return _BUILD_IMG_CACHE[key]
+
+    outdir = tempfile.mkdtemp(prefix="nanollm_build_") \
+        if "_BUILD_DIR" not in globals() else globals()["_BUILD_DIR"]
+    globals()["_BUILD_DIR"] = outdir
+
+    # Structural diagrams from build_viz
+    diagram_paths = build_viz.render_all(outdir)
+    if key in diagram_paths:
+        _BUILD_IMG_CACHE[key] = diagram_paths[key]
+        return diagram_paths[key]
+
+    # Reused slides from teach.py (rendered with a fixed demo prompt)
+    if key.startswith("teach_"):
+        path = _render_teach_reuse(key, outdir)
+        if path is not None:
+            _BUILD_IMG_CACHE[key] = path
+        return path
+
+    return None
+
+
+def _render_teach_reuse(key: str, outdir: str) -> str | None:
+    """Render one of the teach.py slides using a fixed demo prompt."""
+    try:
+        model, tokenizer, config = _require_loaded()
+    except RuntimeError:
+        return None
+
+    demo_prompt = "The cat sat on the"
+    token_ids = tokenizer.encode(demo_prompt, add_special=False)
+    if len(token_ids) < 2:
+        return None
+    if len(token_ids) > config.max_seq_len:
+        token_ids = token_ids[:config.max_seq_len]
+    labels = token_labels(tokenizer, token_ids, max_len=8)
+    idx = torch.tensor([token_ids], device=config.device)
+
+    plt_ = _get_plt()
+
+    # Run capture once; reuse for all teach_* slides in this session
+    if "_BUILD_CAPTURE" not in globals():
+        cap = ForwardCapture(model, target_layer=0)
+        with torch.no_grad():
+            model(idx)
+        cap.remove()
+        globals()["_BUILD_CAPTURE"] = cap
+        globals()["_BUILD_LABELS"] = labels
+        globals()["_BUILD_DEMO_IDS"] = token_ids
+    cap = globals()["_BUILD_CAPTURE"]
+    labels = globals()["_BUILD_LABELS"]
+    token_ids = globals()["_BUILD_DEMO_IDS"]
+
+    path = os.path.join(outdir, f"{key}.png")
+
+    if key == "teach_01":
+        slide_01_tokenization(plt_, tokenizer, demo_prompt, token_ids, path)
+    elif key == "teach_08":
+        slide_08_all_heads(plt_, cap.store, labels, path)
+    elif key == "teach_11":
+        slide_11_sampling_rollout(plt_, model, tokenizer, idx, config.device,
+                                  0.8, 40, 0.9, path)
+    else:
+        return None
+
+    return path
+
+
+def render_step_panel(step_idx: int) -> tuple[str, str | None]:
+    """Return (markdown, image_path) for a given step index."""
+    if not (0 <= step_idx < len(_BUILD_STEPS)):
+        return "Unknown step", None
+    title, body, img_key = _BUILD_STEPS[step_idx]
+    md = f"### {title}\n\n{body}"
+    img = _render_build_image(img_key) if img_key else None
+    return md, img
+
+
+# ═══════════════════════════════════════════════════════════════
 # UI layout
 # ═══════════════════════════════════════════════════════════════
 
@@ -523,6 +810,68 @@ def build_ui() -> gr.Blocks:
                 run_bench,
                 inputs=[bench_prompt, bench_n],
                 outputs=[bench_img, bench_summary],
+            )
+
+        # ── Tab 5: Build Steps ──
+        with gr.Tab("Build Steps"):
+            gr.Markdown(
+                "A 12-step tour of how this project was actually built, in the order "
+                "a new builder should follow. Complements the standalone `BUILDING.md` "
+                "with inline visualisations. Use ◀ / ▶ to walk through, or pick any "
+                "step from the list."
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=220):
+                    build_radio = gr.Radio(
+                        choices=[s[0].split("·")[0].strip() for s in _BUILD_STEPS],
+                        value=_BUILD_STEPS[0][0].split("·")[0].strip(),
+                        label="Step", interactive=True,
+                    )
+                    with gr.Row():
+                        build_prev = gr.Button("◀ Previous", size="sm")
+                        build_next = gr.Button("Next ▶", size="sm", variant="primary")
+                with gr.Column(scale=3):
+                    build_md = gr.Markdown(_BUILD_STEPS[0][1])  # eager first step
+                    build_img = gr.Image(
+                        label="Visualisation", type="filepath",
+                        show_label=False, height=500,
+                    )
+
+            def _idx_from_choice(choice: str) -> int:
+                for i, s in enumerate(_BUILD_STEPS):
+                    if s[0].split("·")[0].strip() == choice:
+                        return i
+                return 0
+
+            def on_select(choice):
+                md, img = render_step_panel(_idx_from_choice(choice))
+                return md, img
+
+            def on_prev(choice):
+                i = max(0, _idx_from_choice(choice) - 1)
+                new_choice = _BUILD_STEPS[i][0].split("·")[0].strip()
+                md, img = render_step_panel(i)
+                return new_choice, md, img
+
+            def on_next(choice):
+                i = min(len(_BUILD_STEPS) - 1, _idx_from_choice(choice) + 1)
+                new_choice = _BUILD_STEPS[i][0].split("·")[0].strip()
+                md, img = render_step_panel(i)
+                return new_choice, md, img
+
+            build_radio.change(on_select, inputs=build_radio,
+                               outputs=[build_md, build_img])
+            build_prev.click(on_prev, inputs=build_radio,
+                             outputs=[build_radio, build_md, build_img])
+            build_next.click(on_next, inputs=build_radio,
+                             outputs=[build_radio, build_md, build_img])
+
+            # Eager-render the first step's image on load so the initial view
+            # isn't empty
+            demo.load(
+                lambda: render_step_panel(0),
+                inputs=None,
+                outputs=[build_md, build_img],
             )
 
         gr.Markdown(

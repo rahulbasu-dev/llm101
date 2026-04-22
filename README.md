@@ -173,10 +173,11 @@ A single-page browser app (`app.py`) with four tabs:
 
 | Tab | Shows |
 |------|-------|
-| **Generate**  | Prompt box + sliders (temp/top-k/top-p/max_tokens), toggle KV cache on/off. **Tokens stream in token-by-token** so the audience sees the autoregressive loop happening |
-| **Teach**     | Renders the 16-slide forward-pass walkthrough on-the-fly for any prompt + layer + head (re-runs forward hooks; no disk caching) |
-| **Attention** | Single-head heatmap + attention rollout across all layers, for any prompt |
-| **Benchmark** | One-click `generate()` vs `generate_fast()` comparison — bar chart with tok/s and speedup factor |
+| **Generate**    | Prompt box + sliders (temp/top-k/top-p/max_tokens), toggle KV cache on/off. **Tokens stream in token-by-token** so the audience sees the autoregressive loop happening |
+| **Teach**       | Renders the 16-slide forward-pass walkthrough on-the-fly for any prompt + layer + head (re-runs forward hooks; no disk caching) |
+| **Attention**   | Single-head heatmap + attention rollout across all layers, for any prompt |
+| **Benchmark**   | One-click `generate()` vs `generate_fast()` comparison — bar chart with tok/s and speedup factor |
+| **Build Steps** | 12-step interactive tour of how this project was assembled — config → tokenizer → dataset → model → training → generation → KV cache → teach → visualise → UI → tests → run. Each step has a markdown explanation + a visualisation (see also `BUILDING.md`) |
 
 Launch with `bash run.sh ui`. Without a trained checkpoint it uses random weights and shows a banner reminder — the UI still renders, useful for demoing the architecture alone.
 
@@ -192,7 +193,9 @@ Launch with `bash run.sh ui`. Without a trained checkpoint it uses random weight
 | `generate.py` | Interactive generation with top-k + nucleus sampling |
 | `visualise.py` | Attention heatmaps and rollout analysis |
 | `teach.py` | **16-slide forward-pass walkthrough** (tokenization → sampling) |
-| `app.py` | **Gradio webinar console** — 4-tab browser UI |
+| `app.py` | **Gradio webinar console** — 5-tab browser UI |
+| `build_viz.py` | Structural-diagram generators (pipeline, block, KV flow, etc.) for the Build Steps tab |
+| `BUILDING.md` | Step-by-step build tutorial (the source for the Build Steps tab) |
 | `tests/` | 48-test pytest suite (CPU-only, mock corpus, ~18s incl. UI smoke) |
 | `run.sh` | One-command setup/train/generate/visualise/teach/benchmark/test/ui |
 | `REFERENCES.md` | Slide-to-Raschka-chapter cross-walk |
