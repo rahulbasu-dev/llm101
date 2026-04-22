@@ -85,11 +85,14 @@ do_setup() {
     fi
 
     echo -e "${GREEN}[2/4] Installing CUDA-enabled PyTorch (cu121) + deps...${NC}"
+    echo -e "${YELLOW}    (torch cu121 is ~2 GB — 3-10 min depending on connection)${NC}"
     $PIP install --upgrade pip -q
     # CUDA-enabled build (cu121 — works with any RTX 3xxx/4xxx/5xxx GPU).
     # LLM101 requires CUDA; see config.require_cuda().
+    # NOT using -q here: users need to see progress bars on the multi-GB
+    # torch download, otherwise the terminal looks frozen for minutes.
     $PIP install --upgrade torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu121 -q
+        --index-url https://download.pytorch.org/whl/cu121
     $PIP install matplotlib numpy tqdm pytest -q
 
     echo -e "${GREEN}[3/4] Verifying GPU...${NC}"
