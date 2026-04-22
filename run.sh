@@ -196,13 +196,39 @@ do_ui() {
     PYTHONIOENCODING=utf-8 python3 app.py "$@"
 }
 
-# ── Verify (quick shape test without training) ──────────────
+# ── Verify (GPU + shape test + tokenizer test) ──────────────
 do_verify() {
     source .venv/bin/activate 2>/dev/null || true
-    echo -e "${GREEN}Running model shape verification...${NC}"
+
+    # Step 0: explicit CUDA probe — the smoke tests below pass on CPU torch,
+    # which hides whether the setup actually gave you GPU access.
+    echo -e "${GREEN}[1/3] GPU / CUDA check...${NC}"
+    python3 -c "
+import sys, torch
+if '+cpu' in torch.__version__:
+    print(f'  ✗ torch build: {torch.__version__} (CPU-only!)')
+    print('    Fix:  bash run.sh setup')
+    print('    (this re-runs the cu121 wheel install)')
+    sys.exit(1)
+if not torch.cuda.is_available():
+    print(f'  ✗ torch {torch.__version__} installed but no CUDA device detected.')
+    print('    - Check driver:  nvidia-smi')
+    print('    - In WSL2, the Windows NVIDIA driver exposes the GPU automatically.')
+    print('    - If nvidia-smi works but torch.cuda does not, re-install torch:')
+    print('        bash run.sh setup')
+    sys.exit(1)
+props = torch.cuda.get_device_properties(0)
+print(f'  ✓ GPU:  {props.name}')
+print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
+print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
+print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
+" || { echo -e "${YELLOW}  GPU check failed — fix the above before training.${NC}"; return 1; }
+
+    echo
+    echo -e "${GREEN}[2/3] Model shape + KV-cache equivalence...${NC}"
     python3 model.py
     echo
-    echo -e "${GREEN}Running tokenizer test...${NC}"
+    echo -e "${GREEN}[3/3] Tokenizer roundtrip...${NC}"
     python3 tokenizer.py
 }
 
