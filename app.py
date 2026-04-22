@@ -19,8 +19,19 @@ Run:
 from __future__ import annotations
 import argparse
 import os
+import socket
 import tempfile
 import time
+import warnings
+
+# Silence Gradio 6.0 deprecation warnings that Gradio 5.x emits for APIs that
+# still work fine in 5.x (theme= on Blocks, show_api= on launch). Targeted
+# pattern avoids swallowing unrelated warnings.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*will be removed in Gradio 6\.0.*",
+    category=DeprecationWarning,
+)
 
 import gradio as gr
 import matplotlib
@@ -888,10 +899,31 @@ def build_ui() -> gr.Blocks:
 # Entrypoint
 # ═══════════════════════════════════════════════════════════════
 
+def find_free_port(start_port: int, host: str = "127.0.0.1",
+                   attempts: int = 20) -> int:
+    """Return the first free port at or above `start_port`, probing by bind.
+
+    Gradio's own retry only tries the exact port you pass. This helper walks
+    the next N ports so `bash run.sh ui` Just Works even when a prior instance
+    is still holding 7860.
+    """
+    for port in range(start_port, start_port + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(
+        f"No free port in {start_port}..{start_port + attempts - 1} on {host}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="NanoLLM — Gradio webinar console")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
-    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--port", type=int, default=7860,
+                        help="Preferred starting port (will auto-fallback if busy)")
     parser.add_argument("--share", action="store_true",
                         help="Create a public URL via Gradio's share tunnel")
     parser.add_argument("--host", default="127.0.0.1",
@@ -902,13 +934,19 @@ def main():
     _load_model(args.checkpoint)
     print(f"  {_STATUS}")
 
+    # Auto-fallback to the next free port so a running instance on 7860 doesn't
+    # crash a fresh `bash run.sh ui` call.
+    port = find_free_port(args.port, host=args.host)
+    if port != args.port:
+        print(f"  Port {args.port} is busy — using {port} instead")
+
     demo = build_ui()
     # show_api=False works around a gradio-client schema-introspection bug
     # (TypeError on schema traversal in gradio 4.44.x). The UI still works,
     # we just skip the auto-generated API docs page.
     demo.queue().launch(
         server_name=args.host,
-        server_port=args.port,
+        server_port=port,
         share=args.share,
         show_error=True,
         inbrowser=True,
