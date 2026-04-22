@@ -29,23 +29,31 @@ do_setup() {
     fi
     source .venv/bin/activate
 
-    echo -e "${GREEN}[2/4] Installing PyTorch + dependencies...${NC}"
+    echo -e "${GREEN}[2/4] Installing CUDA-enabled PyTorch (cu121) + deps...${NC}"
     pip install --upgrade pip -q
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 -q 2>/dev/null || \
-    pip install torch torchvision torchaudio -q
-    pip install matplotlib numpy tqdm -q
+    # CUDA-enabled build (cu121 — works with any RTX 3xxx/4xxx/5xxx GPU).
+    # NanoLLM requires CUDA; see config.require_cuda().
+    pip install --upgrade torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu121 -q
+    pip install matplotlib numpy tqdm pytest -q
 
     echo -e "${GREEN}[3/4] Verifying GPU...${NC}"
     python3 -c "
-import torch
-if torch.cuda.is_available():
-    props = torch.cuda.get_device_properties(0)
-    print(f'  ✓ GPU: {props.name}')
-    print(f'  ✓ VRAM: {props.total_mem / 1e9:.1f} GB')
-    print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
-    print(f'  ✓ CUDA: {torch.version.cuda}')
-else:
-    print('  ⚠ No CUDA GPU found — will train on CPU')
+import sys, torch
+if '+cpu' in torch.__version__:
+    print('  ✗ ERROR: CPU-only torch installed (got ' + torch.__version__ + ')')
+    print('  ✗ NanoLLM requires CUDA. Run: bash run.sh setup again.')
+    sys.exit(1)
+if not torch.cuda.is_available():
+    print('  ✗ ERROR: CUDA torch installed but no GPU detected.')
+    print('    - Check NVIDIA driver: run nvidia-smi')
+    print('    - Are you in WSL2 with GPU passthrough enabled?')
+    sys.exit(1)
+props = torch.cuda.get_device_properties(0)
+print(f'  ✓ GPU:  {props.name}')
+print(f'  ✓ VRAM: {props.total_mem / 1e9:.1f} GB')
+print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
+print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
 "
 
     echo -e "${GREEN}[4/4] Downloading training data...${NC}"

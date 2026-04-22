@@ -16,7 +16,7 @@ import math
 import torch
 from torch.cuda.amp import autocast, GradScaler
 
-from config import NanoLLMConfig
+from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM
 from dataset import TextDataset, create_dataloader
@@ -110,7 +110,8 @@ def train():
     config = NanoLLMConfig()
 
     # ── Device setup ────────────────────────────────────────
-    device = config.device
+    # Hard-require CUDA: training the full config on CPU takes hours.
+    device = require_cuda()
     print("=" * 60)
     print("NanoLLM Training")
     print("=" * 60)

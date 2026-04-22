@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-from config import NanoLLMConfig
+from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM, _sample_from_logits
 from teach import (
@@ -71,7 +71,7 @@ def _load_model(checkpoint_path: str = "checkpoints/best.pt") -> None:
     """Load model + tokenizer once. Falls back to random weights if no checkpoint."""
     global _MODEL, _TOKENIZER, _CONFIG, _STATUS
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = require_cuda()  # hard-require CUDA (set NANOLLM_ALLOW_CPU=1 to bypass)
 
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)

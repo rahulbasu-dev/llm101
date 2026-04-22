@@ -19,7 +19,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from config import NanoLLMConfig
+from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM
 
@@ -127,7 +127,7 @@ def visualise(
     text: str,
     output_dir: str = "attention_plots",
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = require_cuda()
 
     # Load model
     print(f"Loading model from {checkpoint_path}...")

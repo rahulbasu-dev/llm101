@@ -9,6 +9,11 @@ Aligned with Sebastian Raschka's
 [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch)
 — see [REFERENCES.md](REFERENCES.md) for the slide ↔ chapter cross-walk.
 
+> **Requires CUDA.** The app entry points (`train`, `generate`, `teach`, `ui`, `visualise`)
+> hard-require a CUDA-capable GPU via `config.require_cuda()`. `bash run.sh setup`
+> installs the `cu121` build of PyTorch. For quick CPU-only exploration:
+> `NANOLLM_ALLOW_CPU=1 bash run.sh ui` (training will be impractically slow).
+
 ## Architecture
 
 ### 1. End-to-end pipeline

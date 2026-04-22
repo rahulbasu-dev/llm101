@@ -1,8 +1,61 @@
 """NanoLLM Configuration — all hyperparameters in one place."""
 
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 import torch
+
+
+# ═══════════════════════════════════════════════════════════════
+# CUDA gate — the application entry points must run on CUDA.
+# Tests intentionally do not call this (they live on CPU for portability).
+# Set NANOLLM_ALLOW_CPU=1 to force-enable CPU mode (e.g. CI runners).
+# ═══════════════════════════════════════════════════════════════
+
+def require_cuda() -> torch.device:
+    """Ensure a CUDA device is available; return it. Otherwise exit loudly.
+
+    Called by every user-facing script (`train.py`, `generate.py`, `teach.py`,
+    `visualise.py`, `app.py`). NOT called by the test suite.
+
+    Bypass for CI or CPU-only demos: set `NANOLLM_ALLOW_CPU=1`.
+    """
+    if os.environ.get("NANOLLM_ALLOW_CPU") == "1":
+        print(" NANOLLM_ALLOW_CPU=1 set — running on CPU. Training will be SLOW.",
+              file=sys.stderr)
+        return torch.device("cpu")
+
+    if torch.cuda.is_available():
+        dev = torch.device("cuda")
+        props = torch.cuda.get_device_properties(0)
+        return dev
+
+    # No CUDA. Print a big, helpful error and exit.
+    print("", file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+    print(" NanoLLM requires CUDA. No CUDA device was detected.", file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+    print(f" Installed torch:  {torch.__version__}", file=sys.stderr)
+    build = "cpu-only" if "+cpu" in torch.__version__ else "unknown"
+    print(f" Torch build:      {build}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(" To install the CUDA build of PyTorch (cu121 — works with any", file=sys.stderr)
+    print(" RTX 3xxx/4xxx/5xxx GPU):", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("   pip install --upgrade torch torchvision torchaudio \\", file=sys.stderr)
+    print("       --index-url https://download.pytorch.org/whl/cu121", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(" Or re-run the project setup:", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("   bash run.sh setup", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(" If you REALLY want to run on CPU (training will take hours):", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("   NANOLLM_ALLOW_CPU=1 bash run.sh ui", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+    sys.exit(2)
 
 
 @dataclass

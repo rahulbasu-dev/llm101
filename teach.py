@@ -39,7 +39,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from config import NanoLLMConfig
+from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer, NUM_BASE, BYTE_OFFSET
 from model import NanoLLM, _sample_from_logits
 
@@ -878,7 +878,7 @@ def slide_16_param_breakdown(plt, model, out_path):
 def teach(checkpoint_path, text, output_dir, layer, head, query_pos,
           temperature, top_k, top_p):
     plt = _get_plt()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = require_cuda()
 
     model, tokenizer, config = load_model(checkpoint_path, device)
 

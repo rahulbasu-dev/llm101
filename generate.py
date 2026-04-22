@@ -12,7 +12,7 @@ import argparse
 import time
 import torch
 
-from config import NanoLLMConfig
+from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM
 
@@ -138,7 +138,7 @@ def main():
                         help="Tokens to generate in --benchmark mode")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = require_cuda()
     model, tokenizer, config = load_model(args.checkpoint, device)
 
     if args.benchmark:

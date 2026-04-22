@@ -28,13 +28,19 @@ from model import NanoLLM
 
 
 @pytest.fixture(autouse=True)
-def _seed_everything():
+def _seed_everything(monkeypatch):
     """Autouse: every test starts from the same RNG state so results are
     reproducible. Tests that need a different seed can call torch.manual_seed
-    again inside the test body."""
+    again inside the test body.
+
+    Also sets NANOLLM_ALLOW_CPU=1 so any test that accidentally triggers
+    require_cuda() doesn't sys.exit — tests stay CPU-portable. Individual
+    tests can monkeypatch this env away to exercise the strict gate.
+    """
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
+    monkeypatch.setenv("NANOLLM_ALLOW_CPU", "1")
     yield
 
 
