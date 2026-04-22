@@ -57,6 +57,7 @@ from teach import (
 )
 from visualise import AttentionCapture, compute_attention_rollout, plot_attention_heatmap
 import build_viz
+import effect_viz
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -542,7 +543,21 @@ def train_stream(max_epochs_override: int, batch_size_override: int,
 
 
 # ═══════════════════════════════════════════════════════════════
-# Tab 6: Build Steps (interactive tutorial)
+# Tab 6: Effects (how each hyperparameter shapes training)
+# ═══════════════════════════════════════════════════════════════
+
+def render_effect_panel(param: str) -> tuple[str, str]:
+    """Return (markdown_caption, image_path) for one effect selection."""
+    outdir = globals().setdefault(
+        "_EFFECT_DIR",
+        tempfile.mkdtemp(prefix="nanollm_effects_"),
+    )
+    img, caption = effect_viz.render(param, outdir)
+    return caption, img
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tab 7: Build Steps (interactive tutorial)
 # ═══════════════════════════════════════════════════════════════
 
 # Step content: (title, body markdown, image-key or None)
@@ -1027,7 +1042,46 @@ def build_ui() -> gr.Blocks:
                 outputs=[train_log, train_plot, train_status, train_samples],
             )
 
-        # ── Tab 6: Build Steps ──
+        # ── Tab 6: Effects ──
+        with gr.Tab("Effects"):
+            gr.Markdown(
+                "**How does each training hyperparameter shape the loss curve?** "
+                "The plots below are schematic (synthetic data, based on the "
+                "standard behavior observed in the ML literature and on small "
+                "transformers). Use them as a reference when choosing settings "
+                "in the **Train** tab."
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=220):
+                    effect_radio = gr.Radio(
+                        choices=effect_viz.PARAMS,
+                        value=effect_viz.PARAMS[0],
+                        label="Parameter",
+                        interactive=True,
+                    )
+                    effect_caption = gr.Markdown()
+                with gr.Column(scale=2):
+                    effect_img = gr.Image(
+                        label="How it shapes training", type="filepath",
+                        show_label=False, height=540,
+                    )
+
+            def on_effect_change(param):
+                caption, img = render_effect_panel(param)
+                return caption, img
+
+            effect_radio.change(
+                on_effect_change, inputs=effect_radio,
+                outputs=[effect_caption, effect_img],
+            )
+            # Eager-render the first plot so the panel isn't blank on load
+            demo.load(
+                lambda: render_effect_panel(effect_viz.PARAMS[0]),
+                inputs=None,
+                outputs=[effect_caption, effect_img],
+            )
+
+        # ── Tab 7: Build Steps ──
         with gr.Tab("Build Steps"):
             gr.Markdown(
                 "A 12-step tour of how this project was actually built, in the order "
