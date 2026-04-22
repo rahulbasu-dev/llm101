@@ -109,7 +109,7 @@ if not torch.cuda.is_available():
     sys.exit(1)
 props = torch.cuda.get_device_properties(0)
 print(f'  ✓ GPU:  {props.name}')
-print(f'  ✓ VRAM: {props.total_mem / 1e9:.1f} GB')
+print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
 print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
 print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
 "
