@@ -130,6 +130,59 @@ def test_checkpoint_roundtrip(tmp_path, tiny_model, tiny_config):
     assert torch.equal(out1, out2)
 
 
+def test_train_iter_auto_scales_warmup_for_short_runs(tmp_path, mock_corpus):
+    """When warmup_steps would eat > 25% of total_steps (common with short
+    demo runs), train_iter should auto-reduce it and emit a visible log
+    message. Conversely, if _warmup_explicit is set, respect the user's value.
+    """
+    from train import train_iter
+
+    (tmp_path / "data").mkdir()
+    corpus_path = tmp_path / "data" / "corpus.txt"
+    corpus_path.write_text(mock_corpus * 3)
+    ckpt_dir = tmp_path / "checkpoints"
+
+    # Tiny run: ~3 batches/epoch × 1 epoch = ~3 total_steps.
+    # warmup_steps=200 is absurd → should auto-scale down.
+    cfg = NanoLLMConfig(
+        d_model=32, n_layers=2, n_heads=2, d_ff=64,
+        max_seq_len=16, dropout=0.0,
+        max_epochs=1, log_interval=1, save_interval=1,
+        target_vocab_size=300, batch_size=64,
+        warmup_steps=200,  # ← the mistuned value
+        data_path=str(corpus_path),
+        tokenizer_path=str(tmp_path / "tok.json"),
+        checkpoint_dir=str(ckpt_dir),
+    )
+
+    events = list(train_iter(cfg))
+    # Auto-scale should have fired and logged a notice
+    notices = [e for e in events if e["type"] == "log"
+               and "auto-reducing" in e["msg"].lower()]
+    assert notices, "train_iter should auto-reduce over-long warmup and log it"
+    # Final warmup_steps should be smaller than the original 200
+    assert cfg.warmup_steps < 200
+    assert cfg.warmup_steps >= 20  # minimum floor respected
+
+    # ── Same run but with _warmup_explicit → auto-scale MUST NOT fire ──
+    cfg2 = NanoLLMConfig(
+        d_model=32, n_layers=2, n_heads=2, d_ff=64,
+        max_seq_len=16, dropout=0.0,
+        max_epochs=1, log_interval=1, save_interval=1,
+        target_vocab_size=300, batch_size=64,
+        warmup_steps=200,
+        data_path=str(corpus_path),
+        tokenizer_path=str(tmp_path / "tok2.json"),
+        checkpoint_dir=str(tmp_path / "ckpt2"),
+    )
+    setattr(cfg2, "_warmup_explicit", True)
+    events2 = list(train_iter(cfg2))
+    notices2 = [e for e in events2 if e["type"] == "log"
+                and "auto-reducing" in e["msg"].lower()]
+    assert not notices2, "auto-scale must be skipped when _warmup_explicit is set"
+    assert cfg2.warmup_steps == 200  # value preserved
+
+
 def test_train_iter_yields_expected_event_types(tmp_path, mock_corpus, monkeypatch):
     """A tiny end-to-end training run through train_iter() must yield at least
     one of every event type the UI and CLI depend on. This pins the generator

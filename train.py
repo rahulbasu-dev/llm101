@@ -16,6 +16,7 @@ Architecture:
 """
 
 from __future__ import annotations
+import argparse
 import os
 import sys
 import time
@@ -195,6 +196,21 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
            "msg": f"Batches per epoch: {len(dataloader)} (train) | "
                   f"{len(val_dataloader)} (val)  ·  Total steps: {total_steps:,}"}
 
+    # ── Auto-scale warmup_steps for short runs ─────────────────
+    # config.warmup_steps=200 is tuned for long runs (~2000+ steps). For short
+    # demo runs (< ~800 steps), warmup eats too much of the schedule — the model
+    # barely gets any training at the peak LR. Rule of thumb: warmup = 10% of
+    # total, capped at 200, min 20.  Skipped if user passed --warmup-steps
+    # explicitly (see _warmup_explicit flag set by CLI).
+    warmup_explicit = getattr(config, "_warmup_explicit", False)
+    if not warmup_explicit and config.warmup_steps > total_steps // 4:
+        original = config.warmup_steps
+        config.warmup_steps = max(20, min(200, total_steps // 10))
+        yield {"type": "log",
+               "msg": f"Note: warmup_steps {original} was > 25% of total_steps "
+                      f"({total_steps}) — auto-reducing to {config.warmup_steps} "
+                      f"(~10% of total, better for short runs)."}
+
     # ── Model & optimizer ──
     model = NanoLLM(config).to(device)
     decay_params, no_decay_params = [], []
@@ -336,9 +352,38 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
 # CLI wrapper — consumes train_iter, formats to stdout
 # ═══════════════════════════════════════════════════════════════
 
+def _parse_cli_args():
+    p = argparse.ArgumentParser(
+        description="LLM101 Training",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument("--max-epochs", type=int, default=None,
+                   help="Override config.max_epochs (default: 15)")
+    p.add_argument("--warmup-steps", type=int, default=None,
+                   help="Override config.warmup_steps (default: auto-scaled\n"
+                        "to ~10%% of total steps; set explicitly to disable auto-scale)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Override config.batch_size (default: 64). Lower if OOM.")
+    p.add_argument("--learning-rate", type=float, default=None,
+                   help="Override config.learning_rate (default: 3e-4)")
+    p.add_argument("--dropout", type=float, default=None,
+                   help="Override config.dropout (default: 0.1)")
+    return p.parse_args()
+
+
 def train():
     """Command-line training entrypoint. Formats train_iter events to stdout."""
     cfg = NanoLLMConfig()
+    args = _parse_cli_args()
+    if args.max_epochs is not None:    cfg.max_epochs = args.max_epochs
+    if args.warmup_steps is not None:
+        cfg.warmup_steps = args.warmup_steps
+        # User explicitly asked for this value — opt out of auto-scaling
+        setattr(cfg, "_warmup_explicit", True)
+    if args.batch_size is not None:    cfg.batch_size = args.batch_size
+    if args.learning_rate is not None: cfg.learning_rate = args.learning_rate
+    if args.dropout is not None:       cfg.dropout = args.dropout
+
     log_interval = cfg.log_interval
 
     for evt in train_iter(cfg):

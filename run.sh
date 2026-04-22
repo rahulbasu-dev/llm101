@@ -141,7 +141,9 @@ print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
 do_train() {
     source .venv/bin/activate 2>/dev/null || true
     echo -e "${GREEN}Starting LLM101 training...${NC}"
-    python3 train.py
+    # All args pass through to train.py — supports:
+    #   bash run.sh train --max-epochs 10 --warmup-steps 50 --batch-size 32
+    python3 train.py "$@"
 }
 
 # ── Generate ────────────────────────────────────────────────
@@ -237,7 +239,7 @@ banner
 
 case "${1:-help}" in
     setup)      do_setup ;;
-    train)      do_train ;;
+    train)      shift; do_train "$@" ;;
     generate)   shift; do_generate "$@" ;;
     visualise)  shift; do_visualise "$@" ;;
     teach)      shift; do_teach "$@" ;;
