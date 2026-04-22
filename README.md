@@ -160,7 +160,25 @@ bash run.sh visualise
 
 # 8. Run the test suite (pytest, CPU-only, no real data needed)
 bash run.sh test
+
+# 9. Launch the Gradio webinar console (browser UI)
+bash run.sh ui                  # local   → http://127.0.0.1:7860
+bash run.sh ui --share          # public URL (webinar mode)
+bash run.sh ui --host 0.0.0.0   # expose on LAN
 ```
+
+## Web UI — Gradio Webinar Console
+
+A single-page browser app (`app.py`) with four tabs:
+
+| Tab | Shows |
+|------|-------|
+| **Generate**  | Prompt box + sliders (temp/top-k/top-p/max_tokens), toggle KV cache on/off. **Tokens stream in token-by-token** so the audience sees the autoregressive loop happening |
+| **Teach**     | Renders the 16-slide forward-pass walkthrough on-the-fly for any prompt + layer + head (re-runs forward hooks; no disk caching) |
+| **Attention** | Single-head heatmap + attention rollout across all layers, for any prompt |
+| **Benchmark** | One-click `generate()` vs `generate_fast()` comparison — bar chart with tok/s and speedup factor |
+
+Launch with `bash run.sh ui`. Without a trained checkpoint it uses random weights and shows a banner reminder — the UI still renders, useful for demoing the architecture alone.
 
 ## Files
 
@@ -174,8 +192,9 @@ bash run.sh test
 | `generate.py` | Interactive generation with top-k + nucleus sampling |
 | `visualise.py` | Attention heatmaps and rollout analysis |
 | `teach.py` | **16-slide forward-pass walkthrough** (tokenization → sampling) |
-| `tests/` | 42-test pytest suite (CPU-only, mock corpus, ~4s to run) |
-| `run.sh` | One-command setup/train/generate/visualise/teach/benchmark/test |
+| `app.py` | **Gradio webinar console** — 4-tab browser UI |
+| `tests/` | 48-test pytest suite (CPU-only, mock corpus, ~18s incl. UI smoke) |
+| `run.sh` | One-command setup/train/generate/visualise/teach/benchmark/test/ui |
 | `REFERENCES.md` | Slide-to-Raschka-chapter cross-walk |
 | `docs/superpowers/specs/` | Design docs for enhancements |
 

@@ -117,6 +117,19 @@ do_test() {
     PYTHONIOENCODING=utf-8 python3 -m pytest tests/ "$@"
 }
 
+# ── UI (Gradio webinar console) ─────────────────────────────
+do_ui() {
+    source .venv/bin/activate 2>/dev/null || true
+    # Gradio 5.x — 4.44 has a schema-introspection bug that crashes on launch.
+    if ! python3 -c "import gradio; v=int(gradio.__version__.split('.')[0]); exit(0 if v>=5 else 1)" 2>/dev/null; then
+        echo -e "${YELLOW}Installing/upgrading gradio to 5.x...${NC}"
+        pip install "gradio>=5,<6" -q
+    fi
+    echo -e "${GREEN}Launching NanoLLM Webinar Console on http://127.0.0.1:7860 ...${NC}"
+    echo -e "${YELLOW}Tip: add --share for a public URL (webinar mode)${NC}"
+    PYTHONIOENCODING=utf-8 python3 app.py "$@"
+}
+
 # ── Verify (quick shape test without training) ──────────────
 do_verify() {
     source .venv/bin/activate 2>/dev/null || true
@@ -138,6 +151,7 @@ case "${1:-help}" in
     teach)      shift; do_teach "$@" ;;
     benchmark)  shift; do_benchmark "$@" ;;
     test)       shift; do_test "$@" ;;
+    ui)         shift; do_ui "$@" ;;
     verify)     do_verify ;;
     *)
         echo "Usage: bash run.sh <command>"
@@ -151,6 +165,7 @@ case "${1:-help}" in
         echo "  teach      Generate 16-slide step-by-step forward-pass walkthrough"
         echo "  benchmark  Compare generate() vs generate_fast() (KV-cache speedup)"
         echo "  test       Run pytest suite on mock data (CPU, no training data needed)"
+        echo "  ui         Launch Gradio webinar console (Generate/Teach/Attention/Benchmark tabs)"
         echo
         echo "Quick start:"
         echo "  bash run.sh setup"
