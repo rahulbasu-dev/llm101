@@ -7,14 +7,23 @@ Features:
   • Gradient clipping
   • Periodic generation samples (watch the model learn in real time)
   • Checkpoint saving
+
+Architecture:
+  train_iter(cfg) is a generator that yields structured events
+  (log / step / epoch / best / done / error). Consumers — the CLI
+  `train()` wrapper below, and app.py's Train tab — share one training
+  implementation.  No duplicated loops; one source of truth.
 """
 
+from __future__ import annotations
 import os
 import sys
 import time
 import math
+from typing import Iterator
+
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler  # unified API (torch 2.x) — accepts device_type
 
 from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
@@ -22,15 +31,16 @@ from model import NanoLLM
 from dataset import TextDataset, create_dataloader
 
 
+# ═══════════════════════════════════════════════════════════════
+# Helpers (unchanged from prior version)
+# ═══════════════════════════════════════════════════════════════
+
 def get_lr(step: int, config: NanoLLMConfig, total_steps: int) -> float:
     """Learning rate schedule: linear warmup → cosine decay."""
-    # Warmup phase
     if step < config.warmup_steps:
         return config.learning_rate * (step + 1) / config.warmup_steps
-    # Cosine decay phase
     decay_steps = total_steps - config.warmup_steps
     progress = (step - config.warmup_steps) / max(decay_steps, 1)
-    # Decay to 10% of peak LR
     return config.learning_rate * 0.1 + 0.5 * (config.learning_rate * 0.9) * (
         1 + math.cos(math.pi * progress)
     )
@@ -38,14 +48,9 @@ def get_lr(step: int, config: NanoLLMConfig, total_steps: int) -> float:
 
 @torch.no_grad()
 def evaluate(model, dataloader, device, config, use_amp):
-    """Compute average cross-entropy loss on a held-out dataloader.
-
-    Runs in eval mode (dropout off) with no_grad. Uses the same mixed-precision
-    dtype as training for a comparable number.
-    """
+    """Average cross-entropy loss on a held-out dataloader (eval mode)."""
     model.eval()
-    total_loss = 0.0
-    total_tokens = 0
+    total_loss, total_tokens = 0.0, 0
     for input_ids, targets in dataloader:
         input_ids = input_ids.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -60,7 +65,6 @@ def evaluate(model, dataloader, device, config, use_amp):
 
 def save_loss_curve(train_history, epoch_history, path):
     """Render the train/val loss curve to PNG.
-
     train_history: list of (global_step, train_loss)
     epoch_history: list of (epoch, train_avg, val_avg)
     """
@@ -69,23 +73,19 @@ def save_loss_curve(train_history, epoch_history, path):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("  (matplotlib not installed; skipping loss curve)")
-        return
+        return False
 
     if not train_history or not epoch_history:
-        return
+        return False
 
     steps_per_epoch = train_history[-1][0] / max(len(epoch_history), 1)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-
-    # Per-step train loss (faint)
     steps = [s for s, _ in train_history]
     losses = [l for _, l in train_history]
     ax.plot(steps, losses, color="#9ecae1", linewidth=0.7,
             label="Train (per step)", alpha=0.6)
 
-    # Per-epoch averages
     ep_steps = [e * steps_per_epoch for e, _, _ in epoch_history]
     train_avgs = [t for _, t, _ in epoch_history]
     val_avgs = [v for _, _, v in epoch_history]
@@ -103,150 +103,133 @@ def save_loss_curve(train_history, epoch_history, path):
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Loss curve saved: {path}")
+    return True
 
 
-def train():
-    config = NanoLLMConfig()
+# ═══════════════════════════════════════════════════════════════
+# Core: training as a generator of events
+# ═══════════════════════════════════════════════════════════════
 
-    # ── Device setup ────────────────────────────────────────
-    # Hard-require CUDA: training the full config on CPU takes hours.
+def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
+    """Training loop as an event generator.
+
+    Yields dicts with a "type" field:
+      {"type": "log",   "msg": str}                                  — freeform text
+      {"type": "step",  "global_step", "epoch", "loss", "lr",
+                        "grad_norm", "tps"}                          — per-batch
+      {"type": "epoch", "epoch", "train_loss", "val_loss",
+                        "train_ppl", "val_ppl", "elapsed",
+                        "samples": list[str]}                        — per-epoch
+      {"type": "best",  "epoch", "val_loss", "path"}                 — new best val
+      {"type": "done",  "best_val_loss", "curve_path"}               — training over
+      {"type": "error", "msg"}                                       — setup failed
+
+    The CLI wrapper `train()` below consumes these with print();
+    the Gradio Train tab consumes the same events into log/plot widgets.
+    """
+    if config is None:
+        config = NanoLLMConfig()
+
     device = require_cuda()
-    print("=" * 60)
-    print("LLM101 Training")
-    print("=" * 60)
+
+    yield {"type": "log", "msg": "=" * 60}
+    yield {"type": "log", "msg": "LLM101 Training"}
+    yield {"type": "log", "msg": "=" * 60}
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(0)
-        print(f"GPU:   {props.name}")
-        print(f"VRAM:  {props.total_memory / 1e9:.1f} GB")
-        print(f"AMP:   {config.amp_dtype}")
+        yield {"type": "log", "msg": f"GPU:   {props.name}"}
+        yield {"type": "log", "msg": f"VRAM:  {props.total_memory / 1e9:.1f} GB"}
+        yield {"type": "log", "msg": f"AMP:   {config.amp_dtype}"}
     else:
-        print("WARNING: No CUDA device found — training on CPU (will be slow)")
-    print()
+        yield {"type": "log", "msg": "WARNING: Training on CPU — will be slow."}
+    yield {"type": "log", "msg": ""}
 
-    # ── Load / prepare data ─────────────────────────────────
+    # ── Corpus ──
     if not os.path.exists(config.data_path):
-        print(f"ERROR: Training data not found at {config.data_path}")
-        print()
-        print("To get started, download a small corpus:")
-        print()
-        print("  mkdir -p data")
-        print("  # Option A: TinyShakespeare (~1MB)")
-        print("  wget -q https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt -O data/corpus.txt")
-        print()
-        print("  # Option B: Paste your own text into data/corpus.txt")
-        sys.exit(1)
+        yield {"type": "error",
+               "msg": f"Training data not found at {config.data_path}. "
+                      f"Run: bash run.sh setup  (downloads TinyShakespeare)"}
+        return
 
-    print(f"Reading corpus from {config.data_path}...")
+    yield {"type": "log", "msg": f"Reading corpus from {config.data_path}..."}
     with open(config.data_path, "r", encoding="utf-8") as f:
         raw_text = f.read()
-    print(f"Corpus: {len(raw_text):,} characters")
+    yield {"type": "log", "msg": f"Corpus: {len(raw_text):,} characters"}
 
-    # ── Tokenizer ───────────────────────────────────────────
+    # ── Tokenizer ──
     tokenizer = BPETokenizer(target_vocab_size=config.target_vocab_size)
-
     if os.path.exists(config.tokenizer_path):
         tokenizer.load(config.tokenizer_path)
+        yield {"type": "log", "msg": f"Loaded tokenizer from {config.tokenizer_path}"}
     else:
-        print("\nTraining BPE tokenizer...")
+        yield {"type": "log", "msg": "Training BPE tokenizer (this is the slow step)..."}
         tokenizer.train(raw_text)
         tokenizer.save(config.tokenizer_path)
-
-    # Update config with actual vocab size
     config.vocab_size = tokenizer.vocab_size
-    print(f"Vocab size: {config.vocab_size}")
+    yield {"type": "log", "msg": f"Vocab size: {config.vocab_size}"}
 
-    # ── Tokenise corpus ─────────────────────────────────────
-    print("\nTokenising corpus...")
+    # ── Tokenise & split ──
+    yield {"type": "log", "msg": "Tokenising corpus..."}
     tokens = tokenizer.encode(raw_text, add_special=False)
-    print(f"Tokens: {len(tokens):,} (compression ratio: {len(raw_text)/len(tokens):.2f}x)")
+    yield {"type": "log",
+           "msg": f"Tokens: {len(tokens):,} "
+                  f"(compression ratio: {len(raw_text)/len(tokens):.2f}x)"}
 
-    # ── Train / Val split (sequential 90/10) ────────────────
-    # Windows overlap, so a random split would leak. Sequential split keeps
-    # the validation tail genuinely held out.
     split = int(0.9 * len(tokens))
-    train_tokens = tokens[:split]
-    val_tokens = tokens[split:]
-
+    train_tokens, val_tokens = tokens[:split], tokens[split:]
     if len(val_tokens) < config.max_seq_len + 1:
-        raise ValueError(
-            f"Val split too small: {len(val_tokens)} tokens < max_seq_len+1 "
-            f"({config.max_seq_len+1}). Use a larger corpus or smaller max_seq_len."
-        )
+        yield {"type": "error",
+               "msg": f"Val split too small: {len(val_tokens)} tokens. "
+                      f"Use larger corpus or smaller max_seq_len."}
+        return
+    yield {"type": "log",
+           "msg": f"Train / Val split: {len(train_tokens):,} / {len(val_tokens):,} tokens"}
 
-    print(f"Train / Val split: {len(train_tokens):,} / {len(val_tokens):,} tokens")
-
-    # ── Datasets & DataLoaders ──────────────────────────────
+    # ── Datasets ──
     train_dataset = TextDataset(train_tokens, config.max_seq_len)
     val_dataset = TextDataset(val_tokens, config.max_seq_len)
     dataloader = create_dataloader(train_dataset, config.batch_size)
     val_dataloader = create_dataloader(val_dataset, config.batch_size, shuffle=False)
     total_steps = len(dataloader) * config.max_epochs
+    yield {"type": "log",
+           "msg": f"Batches per epoch: {len(dataloader)} (train) | "
+                  f"{len(val_dataloader)} (val)  ·  Total steps: {total_steps:,}"}
 
-    print(f"Batches per epoch: {len(dataloader)} (train) | {len(val_dataloader)} (val)")
-    print(f"Total steps: {total_steps:,}")
-    print()
-
-    # ── Model ───────────────────────────────────────────────
+    # ── Model & optimizer ──
     model = NanoLLM(config).to(device)
-    print()
-
-    # ── Optimizer: separate weight-decay groups ─────────────
-    # Apply weight decay to 2D+ params (weight matrices), NOT to
-    # biases, norms, or embeddings — this is standard practice.
-    decay_params = []
-    no_decay_params = []
-    for name, param in model.named_parameters():
+    decay_params, no_decay_params = [], []
+    for _, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.dim() >= 2:
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+        (decay_params if param.dim() >= 2 else no_decay_params).append(param)
 
     optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": config.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=config.learning_rate,
-        betas=(0.9, 0.95),  # β2=0.95 is standard for LLM training
-        eps=1e-8,
+        [{"params": decay_params, "weight_decay": config.weight_decay},
+         {"params": no_decay_params, "weight_decay": 0.0}],
+        lr=config.learning_rate, betas=(0.9, 0.95), eps=1e-8,
     )
+    yield {"type": "log",
+           "msg": f"Optimizer: AdamW (lr={config.learning_rate}, wd={config.weight_decay})  "
+                  f"· decay={sum(p.numel() for p in decay_params):,}  "
+                  f"no-decay={sum(p.numel() for p in no_decay_params):,}"}
 
-    print(f"Optimizer: AdamW (lr={config.learning_rate}, wd={config.weight_decay})")
-    print(f"  Decay params:    {sum(p.numel() for p in decay_params):,}")
-    print(f"  No-decay params: {sum(p.numel() for p in no_decay_params):,}")
-
-    # ── Mixed precision ─────────────────────────────────────
     use_amp = device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp and config.amp_dtype == torch.float16)
+    # GradScaler only needed for fp16 (bf16 has enough dynamic range to skip scaling).
+    scaler = GradScaler(device.type, enabled=use_amp and config.amp_dtype == torch.float16)
 
-    # ── Checkpointing setup ─────────────────────────────────
     os.makedirs(config.checkpoint_dir, exist_ok=True)
+    gen_prompts = ["The ", "To be or not to be", "Once upon a time", "What is"]
 
-    # ── Training prompts for periodic generation ────────────
-    gen_prompts = [
-        "The ",
-        "To be or not to be",
-        "Once upon a time",
-        "What is",
-    ]
+    yield {"type": "log", "msg": ""}
+    yield {"type": "log", "msg": "=" * 60}
+    yield {"type": "log", "msg": "Starting training..."}
+    yield {"type": "log", "msg": "=" * 60}
 
-    # ═══════════════════════════════════════════════════════════
-    # Training Loop
-    # ═══════════════════════════════════════════════════════════
-    print()
-    print("=" * 60)
-    print("Starting training...")
-    print("=" * 60)
-
+    # ── Training loop ──
     global_step = 0
     best_val_loss = float("inf")
-
-    # Loss history for the end-of-training curve plot
-    train_loss_history = []              # list of (global_step, loss)
-    epoch_history = []                   # list of (epoch, train_avg, val_avg)
+    train_loss_history = []      # (global_step, loss)
+    epoch_history = []           # (epoch, train_avg, val_avg)
 
     for epoch in range(1, config.max_epochs + 1):
         model.train()
@@ -258,30 +241,20 @@ def train():
             input_ids = input_ids.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # Set learning rate for this step
             lr = get_lr(global_step, config, total_steps)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            # Forward pass (mixed precision)
             with autocast(device_type=device.type, dtype=config.amp_dtype, enabled=use_amp):
-                logits, loss = model(input_ids, targets)
+                _, loss = model(input_ids, targets)
 
-            # Backward pass
             scaler.scale(loss).backward()
-
-            # Gradient clipping (unscale first for correct norm computation)
             scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), config.grad_clip
-            )
-
-            # Optimizer step
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            # Accumulate stats
             batch_loss = loss.item()
             batch_tokens = input_ids.numel()
             epoch_loss += batch_loss * batch_tokens
@@ -289,105 +262,131 @@ def train():
             global_step += 1
             train_loss_history.append((global_step, batch_loss))
 
-            # Logging
-            if batch_idx % config.log_interval == 0:
-                elapsed = time.time() - t_epoch
-                tok_per_sec = epoch_tokens / max(elapsed, 1e-6)
-                ppl = math.exp(min(batch_loss, 20))  # Cap to avoid overflow
-                print(
-                    f"  Epoch {epoch:>2}/{config.max_epochs} │ "
-                    f"Step {batch_idx:>4}/{len(dataloader)} │ "
-                    f"Loss {batch_loss:.4f} │ PPL {ppl:>8.1f} │ "
-                    f"LR {lr:.2e} │ "
-                    f"Grad {grad_norm:.2f} │ "
-                    f"{tok_per_sec:,.0f} tok/s"
-                )
+            elapsed = time.time() - t_epoch
+            tps = epoch_tokens / max(elapsed, 1e-6)
 
-        # ── Epoch summary ───────────────────────────────────
+            yield {"type": "step",
+                   "global_step": global_step, "epoch": epoch,
+                   "batch_idx": batch_idx, "total_batches": len(dataloader),
+                   "loss": batch_loss, "lr": lr,
+                   "grad_norm": float(grad_norm),
+                   "tps": tps}
+
+        # ── Epoch summary ──
         avg_loss = epoch_loss / max(epoch_tokens, 1)
         avg_ppl = math.exp(min(avg_loss, 20))
         elapsed = time.time() - t_epoch
-        tok_per_sec = epoch_tokens / max(elapsed, 1e-6)
-
-        # ── Validation loss ─────────────────────────────────
         val_loss = evaluate(model, val_dataloader, device, config, use_amp)
         val_ppl = math.exp(min(val_loss, 20))
         epoch_history.append((epoch, avg_loss, val_loss))
 
-        print()
-        print(f"  ┌─ Epoch {epoch} Summary ───────────────────────────")
-        print(f"  │ Train Loss: {avg_loss:.4f}  │  PPL: {avg_ppl:.1f}")
-        print(f"  │ Val   Loss: {val_loss:.4f}  │  PPL: {val_ppl:.1f}")
-        print(f"  │ Time: {elapsed:.1f}s  │  Throughput: {tok_per_sec:,.0f} tok/s")
-
-        # ── Generate samples ────────────────────────────────
+        # ── Generation samples ──
+        samples = []
         if epoch % config.eval_interval == 0:
             model.eval()
-            print(f"  │")
-            print(f"  │ Generation samples (T={config.temperature}, top_k={config.top_k}):")
             for prompt_text in gen_prompts:
                 prompt_tokens = tokenizer.encode(prompt_text, add_special=False)
                 prompt_tensor = torch.tensor([prompt_tokens], device=device)
                 with torch.no_grad():
                     output = model.generate(
-                        prompt_tensor,
-                        max_new_tokens=60,
+                        prompt_tensor, max_new_tokens=60,
                         temperature=config.temperature,
-                        top_k=config.top_k,
-                        top_p=config.top_p,
+                        top_k=config.top_k, top_p=config.top_p,
                     )
-                generated = tokenizer.decode(output[0].tolist())
-                # Truncate for display
-                display = generated[:200].replace("\n", "↵")
-                print(f"  │   \"{display}\"")
+                generated = tokenizer.decode(output[0].tolist())[:200]
+                samples.append(generated)
             model.train()
 
-        print(f"  └────────────────────────────────────────────────")
-        print()
+        yield {"type": "epoch",
+               "epoch": epoch, "max_epochs": config.max_epochs,
+               "train_loss": avg_loss, "val_loss": val_loss,
+               "train_ppl": avg_ppl, "val_ppl": val_ppl,
+               "elapsed": elapsed,
+               "samples": samples}
 
-        # ── Checkpoint ──────────────────────────────────────
+        # ── Checkpoint ──
         if epoch % config.save_interval == 0 or val_loss < best_val_loss:
             ckpt_path = os.path.join(config.checkpoint_dir, f"epoch_{epoch:03d}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss,
-                    "val_loss": val_loss,
-                    "config": config,
-                },
-                ckpt_path,
-            )
+            torch.save({
+                "epoch": epoch, "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg_loss, "val_loss": val_loss, "config": config,
+            }, ckpt_path)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_path = os.path.join(config.checkpoint_dir, "best.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "model_state_dict": model.state_dict(),
-                        "loss": avg_loss,
-                        "val_loss": val_loss,
-                        "config": config,
-                    },
-                    best_path,
+                torch.save({
+                    "epoch": epoch, "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "loss": avg_loss, "val_loss": val_loss, "config": config,
+                }, best_path)
+                yield {"type": "best", "epoch": epoch,
+                       "val_loss": val_loss, "path": best_path}
+
+    # ── Loss curve & done ──
+    curve_path = os.path.join(config.checkpoint_dir, "loss_curve.png")
+    ok = save_loss_curve(train_loss_history, epoch_history, curve_path)
+    yield {"type": "done",
+           "best_val_loss": best_val_loss,
+           "curve_path": curve_path if ok else None}
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI wrapper — consumes train_iter, formats to stdout
+# ═══════════════════════════════════════════════════════════════
+
+def train():
+    """Command-line training entrypoint. Formats train_iter events to stdout."""
+    cfg = NanoLLMConfig()
+    log_interval = cfg.log_interval
+
+    for evt in train_iter(cfg):
+        t = evt["type"]
+
+        if t == "log":
+            print(evt["msg"])
+
+        elif t == "step":
+            if evt["batch_idx"] % log_interval == 0:
+                ppl = math.exp(min(evt["loss"], 20))
+                print(
+                    f"  Epoch {evt['epoch']:>2}/{cfg.max_epochs} | "
+                    f"Step {evt['batch_idx']:>4}/{evt['total_batches']} | "
+                    f"Loss {evt['loss']:.4f} | PPL {ppl:>8.1f} | "
+                    f"LR {evt['lr']:.2e} | "
+                    f"Grad {evt['grad_norm']:.2f} | "
+                    f"{evt['tps']:,.0f} tok/s"
                 )
-                print(f"  * New best model saved (val_loss={val_loss:.4f})")
 
-    # ── Final: loss curve PNG ───────────────────────────────
-    save_loss_curve(
-        train_loss_history,
-        epoch_history,
-        os.path.join(config.checkpoint_dir, "loss_curve.png"),
-    )
+        elif t == "epoch":
+            print()
+            print(f"  +- Epoch {evt['epoch']} Summary -----------------")
+            print(f"  | Train Loss: {evt['train_loss']:.4f}  |  PPL: {evt['train_ppl']:.1f}")
+            print(f"  | Val   Loss: {evt['val_loss']:.4f}  |  PPL: {evt['val_ppl']:.1f}")
+            print(f"  | Time: {evt['elapsed']:.1f}s")
+            if evt["samples"]:
+                print(f"  | Generation samples:")
+                for s in evt["samples"]:
+                    disp = s.replace("\n", " / ")
+                    print(f"  |   \"{disp}\"")
+            print(f"  +-------------------------------------------------")
+            print()
 
-    print("=" * 60)
-    print("Training complete!")
-    print(f"Best val loss: {best_val_loss:.4f}")
-    print(f"Checkpoints:   {config.checkpoint_dir}/")
-    print("=" * 60)
+        elif t == "best":
+            print(f"  * New best model saved (val_loss={evt['val_loss']:.4f}) -> {evt['path']}")
+
+        elif t == "done":
+            print("=" * 60)
+            print("Training complete!")
+            print(f"Best val loss: {evt['best_val_loss']:.4f}")
+            if evt["curve_path"]:
+                print(f"Loss curve:    {evt['curve_path']}")
+            print("=" * 60)
+
+        elif t == "error":
+            print(f"ERROR: {evt['msg']}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

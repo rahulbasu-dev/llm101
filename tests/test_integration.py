@@ -130,6 +130,57 @@ def test_checkpoint_roundtrip(tmp_path, tiny_model, tiny_config):
     assert torch.equal(out1, out2)
 
 
+def test_train_iter_yields_expected_event_types(tmp_path, mock_corpus, monkeypatch):
+    """A tiny end-to-end training run through train_iter() must yield at least
+    one of every event type the UI and CLI depend on. This pins the generator
+    contract so refactors don't silently break Train-tab streaming.
+    """
+    from train import train_iter
+
+    # Stand up a miniature corpus + env on tmp_path
+    (tmp_path / "data").mkdir()
+    corpus_path = tmp_path / "data" / "corpus.txt"
+    corpus_path.write_text(mock_corpus * 3)
+
+    tok_path = tmp_path / "tokenizer.json"
+    ckpt_dir = tmp_path / "checkpoints"
+
+    cfg = NanoLLMConfig(
+        d_model=32, n_layers=2, n_heads=2, d_ff=64,
+        max_seq_len=16, dropout=0.0,
+        max_epochs=1, warmup_steps=2, log_interval=1, save_interval=1,
+        target_vocab_size=300, batch_size=4,
+        data_path=str(corpus_path),
+        tokenizer_path=str(tok_path),
+        checkpoint_dir=str(ckpt_dir),
+    )
+
+    # Collect all events
+    events = list(train_iter(cfg))
+    types = {e["type"] for e in events}
+
+    # Every event type the UI depends on must appear at least once
+    required = {"log", "step", "epoch", "done"}
+    missing = required - types
+    assert not missing, f"train_iter did not yield: {missing}. Got: {types}"
+
+    # Event shape checks (Train tab will break if these drift)
+    step_evts = [e for e in events if e["type"] == "step"]
+    assert step_evts, "need at least one step event"
+    s = step_evts[0]
+    assert {"global_step", "epoch", "batch_idx", "total_batches",
+            "loss", "lr", "grad_norm", "tps"} <= s.keys()
+
+    epoch_evts = [e for e in events if e["type"] == "epoch"]
+    assert len(epoch_evts) == 1, "should have exactly one epoch event for max_epochs=1"
+    e = epoch_evts[0]
+    assert {"epoch", "max_epochs", "train_loss", "val_loss",
+            "train_ppl", "val_ppl", "elapsed", "samples"} <= e.keys()
+
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1 and "best_val_loss" in done[0]
+
+
 def test_tokenizer_save_then_train_from_loaded(tmp_path, mock_corpus):
     """A loaded tokenizer should encode identically to the original."""
     tok1 = BPETokenizer(target_vocab_size=300)

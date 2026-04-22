@@ -18,6 +18,7 @@ Run:
 
 from __future__ import annotations
 import argparse
+import math
 import os
 import socket
 import tempfile
@@ -43,6 +44,7 @@ import torch.nn.functional as F
 from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM, _sample_from_logits
+from train import train_iter, save_loss_curve
 from teach import (
     ForwardCapture, token_labels, _get_plt,
     slide_01_tokenization, slide_02_embeddings, slide_03_qkv,
@@ -395,7 +397,136 @@ def run_bench(prompt, n_tokens):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Tab 5: Build Steps (interactive tutorial)
+# Tab 5: Train (streams training progress into the UI)
+# ═══════════════════════════════════════════════════════════════
+
+# Module-level lock so we can't accidentally start two trainings at once.
+_TRAINING_LOCK = False
+
+
+def _build_live_curve(history: list[tuple[int, float]],
+                      epochs: list[tuple[int, float, float]]) -> str | None:
+    """Render an in-progress loss curve PNG. Returns the path or None."""
+    if not history:
+        return None
+    outdir = tempfile.mkdtemp(prefix="nanollm_train_curve_")
+    path = os.path.join(outdir, "curve.png")
+    save_loss_curve(history, epochs, path)
+    return path
+
+
+def train_stream(max_epochs_override: int, batch_size_override: int,
+                 checkpoint_path: str = "checkpoints/best.pt"):
+    """Streaming training handler. Yields (log_text, plot_path, status, gen_samples).
+
+    The Gradio UI updates all four outputs once per yielded frame. On completion
+    we reload the global _MODEL so the other tabs pick up the new checkpoint.
+    """
+    global _TRAINING_LOCK, _MODEL, _TOKENIZER, _CONFIG
+
+    if _TRAINING_LOCK:
+        yield ("Training already in progress — wait for it to finish or restart the app.",
+               None, "busy", "")
+        return
+
+    _TRAINING_LOCK = True
+    log_lines: list[str] = []
+    train_history: list[tuple[int, float]] = []
+    epoch_history: list[tuple[int, float, float]] = []
+    samples_text = ""
+    last_plot_path = None
+
+    def as_text():
+        # Tail to last 300 lines to keep the textbox responsive
+        tail = log_lines[-300:] if len(log_lines) > 300 else log_lines
+        return "\n".join(tail)
+
+    try:
+        cfg = NanoLLMConfig()
+        cfg.max_epochs = int(max_epochs_override)
+        cfg.batch_size = int(batch_size_override)
+
+        yield (f"Starting training (epochs={cfg.max_epochs}, batch_size={cfg.batch_size})...",
+               None, "running", "")
+
+        last_emit = time.time()
+        step_counter = 0
+
+        for evt in train_iter(cfg):
+            t = evt["type"]
+
+            if t == "log":
+                log_lines.append(evt["msg"])
+
+            elif t == "step":
+                step_counter += 1
+                train_history.append((evt["global_step"], evt["loss"]))
+                # Emit a log line only every log_interval steps (same cadence as CLI)
+                if evt["batch_idx"] % cfg.log_interval == 0:
+                    ppl = math.exp(min(evt["loss"], 20)) if evt["loss"] < 20 else float("inf")
+                    log_lines.append(
+                        f"  Epoch {evt['epoch']}/{cfg.max_epochs} | "
+                        f"Step {evt['batch_idx']}/{evt['total_batches']} | "
+                        f"Loss {evt['loss']:.4f} | PPL {ppl:.1f} | "
+                        f"LR {evt['lr']:.2e} | {evt['tps']:,.0f} tok/s"
+                    )
+
+            elif t == "epoch":
+                epoch_history.append((evt["epoch"], evt["train_loss"], evt["val_loss"]))
+                log_lines.append("")
+                log_lines.append(
+                    f"  Epoch {evt['epoch']}/{evt['max_epochs']} done  |  "
+                    f"train={evt['train_loss']:.4f}  val={evt['val_loss']:.4f}  "
+                    f"(train_ppl={evt['train_ppl']:.1f}  val_ppl={evt['val_ppl']:.1f})  "
+                    f"time={evt['elapsed']:.1f}s"
+                )
+                if evt["samples"]:
+                    preview = evt["samples"][0].replace("\n", " / ")[:200]
+                    samples_text = (f"Epoch {evt['epoch']} generation sample:\n"
+                                    f"  \"{preview}\"")
+                # Re-render loss curve now that we have new epoch data
+                last_plot_path = _build_live_curve(train_history, epoch_history)
+
+            elif t == "best":
+                log_lines.append(f"  * New best val loss {evt['val_loss']:.4f} "
+                                 f"saved to {evt['path']}")
+
+            elif t == "done":
+                log_lines.append("")
+                log_lines.append("=" * 50)
+                log_lines.append(f"Training complete.  Best val loss: {evt['best_val_loss']:.4f}")
+                log_lines.append(f"Loss curve: {evt['curve_path']}")
+                log_lines.append("=" * 50)
+                last_plot_path = evt["curve_path"] or last_plot_path
+
+            elif t == "error":
+                log_lines.append(f"ERROR: {evt['msg']}")
+                yield (as_text(), last_plot_path, "error", samples_text)
+                return
+
+            # Throttle UI updates so we're not choking SSE with every step
+            now = time.time()
+            if (t in ("epoch", "best", "done", "error")
+                or now - last_emit >= 0.5):
+                yield (as_text(), last_plot_path, "running", samples_text)
+                last_emit = now
+
+        # Training finished — reload the singleton so other tabs see the new model
+        try:
+            _load_model(checkpoint_path)
+            log_lines.append("")
+            log_lines.append(f"Model reloaded.  Status: {_STATUS}")
+        except Exception as e:
+            log_lines.append(f"  (note: couldn't auto-reload model: {e})")
+
+        yield (as_text(), last_plot_path, "done", samples_text)
+
+    finally:
+        _TRAINING_LOCK = False
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tab 6: Build Steps (interactive tutorial)
 # ═══════════════════════════════════════════════════════════════
 
 # Step content: (title, body markdown, image-key or None)
@@ -823,7 +954,51 @@ def build_ui() -> gr.Blocks:
                 outputs=[bench_img, bench_summary],
             )
 
-        # ── Tab 5: Build Steps ──
+        # ── Tab 5: Train ──
+        with gr.Tab("Train"):
+            gr.Markdown(
+                "**Trigger training from the UI and watch progress live.** "
+                "Training writes `checkpoints/best.pt` and `checkpoints/loss_curve.png`. "
+                "When it finishes, the Generate / Teach / Attention tabs pick up the "
+                "new model automatically — no restart. "
+                "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=260):
+                    train_epochs = gr.Slider(
+                        1, 30, value=3, step=1, label="max_epochs",
+                        info="3 is good for a webinar demo; 15 is a full run.",
+                    )
+                    train_batch = gr.Slider(
+                        8, 128, value=64, step=8, label="batch_size",
+                        info="Lower this if you hit OOM (8-16 for small GPUs).",
+                    )
+                    train_btn = gr.Button("Start training", variant="primary", size="lg")
+                    train_status = gr.Textbox(
+                        label="Status", value="idle", interactive=False,
+                    )
+                    train_samples = gr.Textbox(
+                        label="Latest generation sample",
+                        lines=4, interactive=False,
+                    )
+                with gr.Column(scale=2):
+                    train_log = gr.Textbox(
+                        label="Training log (streaming)",
+                        value="(press Start to begin)",
+                        lines=22, max_lines=30, show_copy_button=True,
+                        interactive=False,
+                    )
+                    train_plot = gr.Image(
+                        label="Loss curve (live)", type="filepath", height=340,
+                    )
+
+            train_btn.click(
+                train_stream,
+                inputs=[train_epochs, train_batch],
+                outputs=[train_log, train_plot, train_status, train_samples],
+            )
+
+        # ── Tab 6: Build Steps ──
         with gr.Tab("Build Steps"):
             gr.Markdown(
                 "A 12-step tour of how this project was actually built, in the order "
