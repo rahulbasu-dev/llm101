@@ -416,11 +416,17 @@ def _build_live_curve(history: list[tuple[int, float]],
 
 
 def train_stream(max_epochs_override: int, batch_size_override: int,
+                 learning_rate_override: float, dropout_override: float,
+                 warmup_steps_override: int,
                  checkpoint_path: str = "checkpoints/best.pt"):
     """Streaming training handler. Yields (log_text, plot_path, status, gen_samples).
 
     The Gradio UI updates all four outputs once per yielded frame. On completion
     we reload the global _MODEL so the other tabs pick up the new checkpoint.
+
+    `warmup_steps_override=0` means "keep the config default and let auto-scale
+    run". Any non-zero value is treated as an explicit user choice and bypasses
+    auto-scale (same semantics as `--warmup-steps` on the CLI).
     """
     global _TRAINING_LOCK, _MODEL, _TOKENIZER, _CONFIG
 
@@ -445,8 +451,18 @@ def train_stream(max_epochs_override: int, batch_size_override: int,
         cfg = NanoLLMConfig()
         cfg.max_epochs = int(max_epochs_override)
         cfg.batch_size = int(batch_size_override)
+        cfg.learning_rate = float(learning_rate_override)
+        cfg.dropout = float(dropout_override)
+        if int(warmup_steps_override) > 0:
+            cfg.warmup_steps = int(warmup_steps_override)
+            setattr(cfg, "_warmup_explicit", True)
 
-        yield (f"Starting training (epochs={cfg.max_epochs}, batch_size={cfg.batch_size})...",
+        yield (f"Starting training  "
+               f"(epochs={cfg.max_epochs}  "
+               f"batch={cfg.batch_size}  "
+               f"lr={cfg.learning_rate:.0e}  "
+               f"dropout={cfg.dropout}  "
+               f"warmup={'auto' if not getattr(cfg, '_warmup_explicit', False) else cfg.warmup_steps})",
                None, "running", "")
 
         last_emit = time.time()
@@ -964,14 +980,26 @@ def build_ui() -> gr.Blocks:
                 "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
             )
             with gr.Row():
-                with gr.Column(scale=1, min_width=260):
+                with gr.Column(scale=1, min_width=280):
                     train_epochs = gr.Slider(
-                        1, 30, value=3, step=1, label="max_epochs",
-                        info="3 is good for a webinar demo; 15 is a full run.",
+                        1, 30, value=10, step=1, label="max_epochs",
+                        info="Short (3-5) for demos, longer (10-20) for real runs.",
                     )
                     train_batch = gr.Slider(
                         8, 128, value=64, step=8, label="batch_size",
                         info="Lower this if you hit OOM (8-16 for small GPUs).",
+                    )
+                    train_lr = gr.Slider(
+                        1e-5, 1e-3, value=3e-4, step=1e-5, label="learning_rate",
+                        info="Peak LR after warmup. 3e-4 is the AdamW standard.",
+                    )
+                    train_dropout = gr.Slider(
+                        0.0, 0.4, value=0.1, step=0.05, label="dropout",
+                        info="Increase (0.2-0.3) to fight overfitting.",
+                    )
+                    train_warmup = gr.Slider(
+                        0, 500, value=0, step=10, label="warmup_steps",
+                        info="0 = auto-scale (10% of total steps, recommended).",
                     )
                     train_btn = gr.Button("Start training", variant="primary", size="lg")
                     train_status = gr.Textbox(
@@ -994,7 +1022,8 @@ def build_ui() -> gr.Blocks:
 
             train_btn.click(
                 train_stream,
-                inputs=[train_epochs, train_batch],
+                inputs=[train_epochs, train_batch, train_lr,
+                        train_dropout, train_warmup],
                 outputs=[train_log, train_plot, train_status, train_samples],
             )
 
