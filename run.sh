@@ -23,40 +23,65 @@ banner() {
 
 # ── Setup ───────────────────────────────────────────────────
 do_setup() {
+    # ── Sanity check: warn if running as root ──
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        echo -e "${YELLOW}  ⚠ You are running run.sh as root (sudo).${NC}"
+        echo -e "${YELLOW}    This will install pip packages to root's site-packages,${NC}"
+        echo -e "${YELLOW}    which your non-root user won't find when running Python.${NC}"
+        echo -e "${YELLOW}    Recommended:  exit sudo, then:  bash run.sh setup${NC}"
+        echo -e "${YELLOW}    Use sudo only for 'apt install' (package management).${NC}"
+        echo
+    fi
+
     echo -e "${GREEN}[1/4] Python environment...${NC}"
 
     # Remove any partial / broken venv from a prior failed run (no activate
     # script means ensurepip failed and the directory is useless).
     if [ -d ".venv" ] && [ ! -f ".venv/bin/activate" ]; then
         echo -e "${YELLOW}  Removing broken .venv from a prior failed setup.${NC}"
-        rm -rf .venv
+        rm -rf .venv 2>/dev/null || \
+            { echo -e "${YELLOW}  (Could not rm -rf .venv — probably owned by root. Try:${NC}"
+              echo -e "${YELLOW}     sudo rm -rf .venv   then re-run without sudo)${NC}"
+              return 1; }
     fi
 
-    # Try to create a venv. If it fails (missing python3-venv on
-    # Debian/Ubuntu WSL, or similar), fall back to the system interpreter.
+    # Try to create a venv. Use mktemp for error capture (avoids /tmp/ name
+    # collisions and sudo ownership weirdness). Real error goes to stderr
+    # regardless, so the user sees it.
     if [ ! -d ".venv" ]; then
-        if python3 -m venv .venv 2>/tmp/llm101_venv_err; then
+        VENV_ERR=$(mktemp -t llm101_venv_err.XXXXXX 2>/dev/null || echo "/dev/null")
+        if python3 -m venv .venv 2>"$VENV_ERR"; then
             echo -e "${GREEN}  Created .venv${NC}"
         else
-            echo -e "${YELLOW}  Could not create .venv — falling back to system Python.${NC}"
-            echo -e "${YELLOW}  Original error:${NC}"
-            sed 's/^/    /' /tmp/llm101_venv_err
-            echo
-            echo -e "${YELLOW}  To fix (if you want a venv):${NC}"
-            echo -e "${YELLOW}    Debian/Ubuntu (inside WSL2): apt install python3-venv${NC}"
-            echo -e "${YELLOW}    Then re-run: bash run.sh setup${NC}"
+            echo -e "${YELLOW}  Could not create .venv. Error:${NC}"
+            [ -s "$VENV_ERR" ] && sed 's/^/    /' "$VENV_ERR" || echo "    (no stderr captured)"
             rm -rf .venv 2>/dev/null
+            echo
+            echo -e "${YELLOW}  Fix (Debian/Ubuntu WSL — run ONCE):${NC}"
+            echo -e "${YELLOW}    sudo apt install -y python3-venv python3-pip${NC}"
+            echo -e "${YELLOW}  Then re-run (without sudo):${NC}"
+            echo -e "${YELLOW}    bash run.sh setup${NC}"
+            echo
         fi
+        rm -f "$VENV_ERR" 2>/dev/null
     fi
 
     # Activate the venv if it's usable; otherwise use system Python.
     if [ -f ".venv/bin/activate" ]; then
         source .venv/bin/activate
-        PIP="pip"
-        PY="python3"
-    else
         PIP="python3 -m pip"
-        PY="python3"
+    else
+        # System Python fallback. Detect PEP 668 — Ubuntu 24.04 / Python 3.12+
+        # refuse system-wide pip install without --break-system-packages.
+        # Rather than break the system, we fail with clear instructions.
+        if python3 -c "import pathlib, sys, sysconfig; p = pathlib.Path(sysconfig.get_paths()['stdlib']).parent / 'EXTERNALLY-MANAGED'; sys.exit(0 if p.exists() else 1)"; then
+            echo -e "${YELLOW}  ✗ System Python is externally-managed (PEP 668).${NC}"
+            echo -e "${YELLOW}    Can't pip install without a venv. Fix:${NC}"
+            echo -e "${YELLOW}      sudo apt install -y python3-venv python3-pip${NC}"
+            echo -e "${YELLOW}      bash run.sh setup    (without sudo)${NC}"
+            return 1
+        fi
+        PIP="python3 -m pip"
     fi
 
     echo -e "${GREEN}[2/4] Installing CUDA-enabled PyTorch (cu121) + deps...${NC}"
