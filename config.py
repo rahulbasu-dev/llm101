@@ -8,6 +8,30 @@ import torch
 
 
 # ═══════════════════════════════════════════════════════════════
+# Matplotlib font fix — WSL2 often has no system fonts, which
+# crashes the mathtext parser when measuring text for layout.
+# Force matplotlib to use its bundled DejaVu Sans and rebuild
+# the font cache if it points to missing fonts.
+# ═══════════════════════════════════════════════════════════════
+
+def _fix_matplotlib_fonts():
+    """One-time matplotlib font configuration. Safe to call multiple times."""
+    try:
+        import matplotlib
+        matplotlib.rcParams["font.family"] = "sans-serif"
+        matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+        matplotlib.rcParams["mathtext.fontset"] = "dejavusans"
+        # Rebuild font cache if stale (points to missing system fonts)
+        fm = matplotlib.font_manager
+        if not any("DejaVu" in f.name for f in fm.fontManager.ttflist):
+            fm._load_fontmanager(try_read_cache=False)
+    except Exception:
+        pass
+
+_fix_matplotlib_fonts()
+
+
+# ═══════════════════════════════════════════════════════════════
 # CUDA gate — the application entry points must run on CUDA.
 # Tests intentionally do not call this (they live on CPU for portability).
 # Set NANOLLM_ALLOW_CPU=1 to force-enable CPU mode (e.g. CI runners).
