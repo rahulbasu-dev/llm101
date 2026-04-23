@@ -47,6 +47,7 @@ def test_collect_viz_data_layer_contents(tiny_model, trained_tokenizer, tiny_con
         # shapes: dict with expected keys
         shapes = layer["shapes"]
         assert "input" in shapes
+        assert "qkv" in shapes
         assert "q" in shapes
         assert "k" in shapes
         assert "v" in shapes

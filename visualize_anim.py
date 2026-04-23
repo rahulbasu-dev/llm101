@@ -95,6 +95,7 @@ def collect_viz_data(
                 "weights": weights.detach().cpu(),
                 "shapes": {
                     "input": str(tuple(x_norm.shape)),
+                    "qkv": str(tuple(qkv.shape)),
                     "q": str(tuple(q.shape)),
                     "k": str(tuple(k.shape)),
                     "v": str(tuple(v.shape)),
