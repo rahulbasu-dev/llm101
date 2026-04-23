@@ -1,0 +1,832 @@
+<!--
+  NanoLLM — Animated Transformer Forward Pass Visualization
+  Self-contained HTML/CSS/JS — no external dependencies.
+  Data is injected as JSON via the {{VIZ_DATA_JSON}} placeholder.
+  Designed to render inside Gradio's gr.HTML component.
+-->
+<style>
+/* ================================================================
+   SCOPED STYLES — all rules nested under .nanollm-viz to avoid
+   conflicts when embedded inside Gradio's page.
+   ================================================================ */
+.nanollm-viz {
+  --bg:          #0f172a;
+  --bg-panel:    #1e293b;
+  --bg-cell:     #0c1322;
+  --border:      #334155;
+  --text:        #e2e8f0;
+  --text-dim:    #94a3b8;
+  --accent-blue: #3b82f6;
+  --accent-amber:#f59e0b;
+  --accent-green:#22c55e;
+  --accent-red:  #ef4444;
+  --glow-amber:  0 0 12px rgba(245,158,11,0.5);
+  --glow-blue:   0 0 8px rgba(59,130,246,0.4);
+  --radius:      6px;
+
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  border-radius: 8px;
+}
+.nanollm-viz *, .nanollm-viz *::before, .nanollm-viz *::after {
+  box-sizing: border-box;
+}
+
+/* ── Controls Bar ── */
+.nanollm-viz .nv-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.nanollm-viz .nv-controls button {
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 5px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+.nanollm-viz .nv-controls button:hover { background: #2563eb; }
+.nanollm-viz .nv-controls button.nv-secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.nanollm-viz .nv-controls button.nv-secondary:hover {
+  border-color: var(--accent-blue);
+  color: var(--text);
+}
+.nanollm-viz .nv-controls label {
+  color: var(--text-dim);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.nanollm-viz .nv-controls input[type="range"] {
+  width: 100px;
+  accent-color: var(--accent-blue);
+}
+.nanollm-viz .nv-controls input[type="checkbox"] {
+  accent-color: var(--accent-blue);
+}
+.nanollm-viz .nv-progress {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* ── Three-Column Layout ── */
+.nanollm-viz .nv-main {
+  display: flex;
+  height: 680px;
+  min-height: 500px;
+  overflow: hidden;
+}
+
+/* ── LEFT: Architecture Diagram ── */
+.nanollm-viz .nv-arch {
+  width: 220px;
+  min-width: 220px;
+  overflow-y: auto;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+}
+.nanollm-viz .nv-arch-node {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  text-align: center;
+  transition: all 0.3s;
+  position: relative;
+}
+.nanollm-viz .nv-arch-node .nv-shape {
+  font-size: 9px;
+  color: var(--text-dim);
+  display: block;
+  margin-top: 2px;
+}
+.nanollm-viz .nv-arch-node.upcoming { opacity: 0.4; }
+.nanollm-viz .nv-arch-node.active {
+  border-color: var(--accent-amber);
+  box-shadow: var(--glow-amber);
+  opacity: 1;
+}
+.nanollm-viz .nv-arch-node.done {
+  border-color: var(--accent-blue);
+  box-shadow: var(--glow-blue);
+  opacity: 1;
+}
+.nanollm-viz .nv-arch-arrow {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 14px;
+  margin-bottom: 2px;
+}
+.nanollm-viz .nv-arch-sub {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+  display: block;
+  margin-top: 2px;
+}
+
+/* ── CENTER: Attention Grid ── */
+.nanollm-viz .nv-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 10px;
+  min-width: 0;
+}
+.nanollm-viz .nv-grid-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.nanollm-viz .nv-col-headers {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 2px;
+}
+.nanollm-viz .nv-col-headers span {
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.nanollm-viz .nv-grid {
+  display: grid;
+  gap: 3px;
+  overflow: auto;
+  flex: 1;
+}
+.nanollm-viz .nv-cell {
+  background: var(--bg-cell);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+  transition: border-color 0.2s;
+  overflow: hidden;
+  min-height: 0;
+}
+.nanollm-viz .nv-cell canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.nanollm-viz .nv-cell.unfilled { opacity: 0.25; cursor: default; }
+.nanollm-viz .nv-cell.filled:hover { border-color: var(--accent-blue); }
+.nanollm-viz .nv-cell.selected {
+  border-color: var(--accent-amber);
+  box-shadow: var(--glow-amber);
+}
+.nanollm-viz .nv-cell-label {
+  position: absolute;
+  bottom: 1px;
+  right: 2px;
+  font-size: 8px;
+  color: var(--text-dim);
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+/* ── Detail Panel (below grid) ── */
+.nanollm-viz .nv-detail {
+  display: none;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin-top: 8px;
+  min-height: 0;
+}
+.nanollm-viz .nv-detail.open {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.nanollm-viz .nv-detail-canvas-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.nanollm-viz .nv-detail canvas { border-radius: 3px; }
+.nanollm-viz .nv-detail-info {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.nanollm-viz .nv-detail-info h3 {
+  color: var(--text);
+  margin-bottom: 6px;
+  font-size: 14px;
+}
+.nanollm-viz .nv-detail-info .nv-shape-line {
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  margin: 2px 0;
+}
+
+/* ── RIGHT: Activation Flow ── */
+.nanollm-viz .nv-act {
+  width: 200px;
+  min-width: 200px;
+  overflow-y: auto;
+  padding: 10px 8px;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.nanollm-viz .nv-act-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.nanollm-viz .nv-act-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.nanollm-viz .nv-act-label {
+  width: 38px;
+  text-align: right;
+  flex-shrink: 0;
+}
+.nanollm-viz .nv-act-bar-bg {
+  flex: 1;
+  height: 16px;
+  background: var(--bg-cell);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.nanollm-viz .nv-act-bar {
+  height: 100%;
+  border-radius: 3px;
+  width: 0%;
+  transition: width 0.4s ease, background-color 0.4s ease;
+}
+.nanollm-viz .nv-act-value {
+  width: 40px;
+  text-align: left;
+  font-size: 10px;
+  font-family: monospace;
+  flex-shrink: 0;
+}
+</style>
+
+<!-- ================================================================
+     HTML STRUCTURE — wrapped in .nanollm-viz for CSS scoping
+     ================================================================ -->
+<div class="nanollm-viz">
+  <!-- Controls Bar -->
+  <div class="nv-controls">
+    <button class="nv-btn-play" title="Play / Pause">&#9654; Play</button>
+    <button class="nv-secondary nv-btn-prev" title="Previous layer">&#9664;</button>
+    <button class="nv-secondary nv-btn-next" title="Next layer">&#9654;</button>
+    <label>Speed
+      <input type="range" class="nv-speed" min="300" max="1500" value="800" step="50">
+      <span class="nv-speed-val">0.8s</span>
+    </label>
+    <label><input type="checkbox" class="nv-loop"> Loop</label>
+    <button class="nv-secondary nv-btn-reset">Reset</button>
+    <span class="nv-progress">Loading...</span>
+  </div>
+
+  <!-- Three-Panel Layout -->
+  <div class="nv-main">
+    <!-- LEFT: Architecture Diagram -->
+    <div class="nv-arch"></div>
+
+    <!-- CENTER: Attention Grid + Detail -->
+    <div class="nv-center">
+      <div class="nv-grid-title">All-Heads Attention Grid</div>
+      <div class="nv-col-headers"></div>
+      <div class="nv-grid"></div>
+      <div class="nv-detail">
+        <div class="nv-detail-canvas-wrap"><canvas class="nv-detail-canvas" width="300" height="300"></canvas></div>
+        <div class="nv-detail-info"></div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Activation Flow -->
+    <div class="nv-act">
+      <div class="nv-act-title">Activation Norms</div>
+    </div>
+  </div>
+</div>
+
+<!-- ================================================================
+     JAVASCRIPT — IIFE to avoid global pollution
+     ================================================================ -->
+<script>
+(function() {
+  "use strict";
+
+  // ── Data injection (replaced by Python before serving) ──
+  var DATA = {{VIZ_DATA_JSON}};
+
+  var nLayers = DATA.n_layers;
+  var nHeads  = DATA.n_heads;
+  var tokens  = DATA.tokens;
+  var T       = tokens.length;
+
+  // ── Scoped DOM queries ──
+  var root = document.querySelector(".nanollm-viz");
+  function q(sel)  { return root.querySelector(sel); }
+
+  // ── Animation state ──
+  var currentLayer = -1;   // -1 = not started
+  var playing      = false;
+  var timer        = null;
+  var selectedCell = null;  // {layer, head} or null
+
+  // ── DOM refs (scoped to .nanollm-viz) ──
+  var btnPlay      = q(".nv-btn-play");
+  var btnPrev      = q(".nv-btn-prev");
+  var btnNext      = q(".nv-btn-next");
+  var btnReset     = q(".nv-btn-reset");
+  var speedSlider  = q(".nv-speed");
+  var speedVal     = q(".nv-speed-val");
+  var chkLoop      = q(".nv-loop");
+  var progressTxt  = q(".nv-progress");
+  var archPanel    = q(".nv-arch");
+  var attnGrid     = q(".nv-grid");
+  var colHeaders   = q(".nv-col-headers");
+  var actPanel     = q(".nv-act");
+  var detailPanel  = q(".nv-detail");
+  var detailCanvas = q(".nv-detail-canvas");
+  var detailInfo   = q(".nv-detail-info");
+
+  // ============================================================
+  // INIT: Build Architecture Diagram (left panel)
+  // ============================================================
+  function buildArchDiagram() {
+    var h = "";
+    h += '<div class="nv-arch-node upcoming" data-id="embed">Embedding';
+    h += '<span class="nv-shape">(B, T) &rarr; (B, T, ' + DATA.d_model + ')</span></div>';
+    h += '<div class="nv-arch-arrow">&darr;</div>';
+
+    for (var i = 0; i < nLayers; i++) {
+      h += '<div class="nv-arch-node upcoming" data-id="block-' + i + '">';
+      h += '<b>Block ' + i + '</b>';
+      h += '<span class="nv-arch-sub">RMSNorm &rarr; Self-Attn &rarr; + residual<br>';
+      h += 'RMSNorm &rarr; FFN (SwiGLU) &rarr; + residual</span>';
+      h += '<span class="nv-shape" data-shape="' + i + '"></span>';
+      h += '</div>';
+      h += '<div class="nv-arch-arrow">&darr;</div>';
+    }
+
+    h += '<div class="nv-arch-node upcoming" data-id="norm">RMSNorm</div>';
+    h += '<div class="nv-arch-arrow">&darr;</div>';
+    h += '<div class="nv-arch-node upcoming" data-id="lmhead">LM Head';
+    h += '<span class="nv-shape">(' + DATA.d_model + ') &rarr; vocab</span></div>';
+
+    archPanel.innerHTML = h;
+  }
+
+  function archNode(id) {
+    return archPanel.querySelector('[data-id="' + id + '"]');
+  }
+
+  function shapeSpan(layerIdx) {
+    return archPanel.querySelector('[data-shape="' + layerIdx + '"]');
+  }
+
+  // ============================================================
+  // INIT: Build Attention Grid (nLayers rows x nHeads columns)
+  // ============================================================
+  var cellCanvases = [];  // [layer][head] = {canvas, ctx, cell}
+
+  function buildAttnGrid() {
+    attnGrid.style.gridTemplateColumns = "repeat(" + nHeads + ", 1fr)";
+    attnGrid.style.gridTemplateRows    = "repeat(" + nLayers + ", 1fr)";
+    colHeaders.style.gridTemplateColumns = "repeat(" + nHeads + ", 1fr)";
+
+    var hdr = "";
+    for (var h = 0; h < nHeads; h++) {
+      hdr += "<span>Head " + h + "</span>";
+    }
+    colHeaders.innerHTML = hdr;
+
+    cellCanvases = [];
+    for (var l = 0; l < nLayers; l++) {
+      cellCanvases[l] = [];
+      for (var hd = 0; hd < nHeads; hd++) {
+        var cell = document.createElement("div");
+        cell.className = "nv-cell unfilled";
+        cell.dataset.layer = l;
+        cell.dataset.head  = hd;
+
+        var cvs = document.createElement("canvas");
+        cvs.width  = T;
+        cvs.height = T;
+        cell.appendChild(cvs);
+
+        var lbl = document.createElement("span");
+        lbl.className = "nv-cell-label";
+        lbl.textContent = "L" + l + "H" + hd;
+        cell.appendChild(lbl);
+
+        cell.addEventListener("click", onCellClick);
+        attnGrid.appendChild(cell);
+
+        cellCanvases[l][hd] = { canvas: cvs, ctx: cvs.getContext("2d"), cell: cell };
+      }
+    }
+  }
+
+  // ============================================================
+  // INIT: Build Activation Bars (right panel)
+  // ============================================================
+  var actBars = [];   // bar DOM elements
+  var actVals = [];   // value text spans
+
+  function buildActBars() {
+    var h = "";
+    for (var i = 0; i < nLayers; i++) {
+      h += '<div class="nv-act-row">';
+      h += '<span class="nv-act-label">L' + i + '</span>';
+      h += '<div class="nv-act-bar-bg"><div class="nv-act-bar" data-bar="' + i + '"></div></div>';
+      h += '<span class="nv-act-value" data-val="' + i + '">--</span>';
+      h += '</div>';
+    }
+    actPanel.innerHTML = '<div class="nv-act-title">Activation Norms</div>' + h;
+
+    actBars = [];
+    actVals = [];
+    for (var j = 0; j < nLayers; j++) {
+      actBars.push(actPanel.querySelector('[data-bar="' + j + '"]'));
+      actVals.push(actPanel.querySelector('[data-val="' + j + '"]'));
+    }
+  }
+
+  // ============================================================
+  // RENDERING: Draw T x T heatmap onto a canvas (mini grid cell)
+  // ============================================================
+  function drawHeatmap(ctx, matrix, w, h) {
+    var imgData = ctx.createImageData(w, h);
+    for (var r = 0; r < h; r++) {
+      for (var c = 0; c < w; c++) {
+        var v = (r < matrix.length && c < matrix[r].length) ? matrix[r][c] : 0;
+        v = Math.max(0, Math.min(1, v));
+        // Sequential blue colormap: white (v=0) -> dark blue (v=1)
+        var red   = Math.round(255 * (1 - v));
+        var green = Math.round(255 * (1 - v));
+        var blue  = Math.round(255 * (1 - v * 0.5));
+        var idx = (r * w + c) * 4;
+        imgData.data[idx]     = red;
+        imgData.data[idx + 1] = green;
+        imgData.data[idx + 2] = blue;
+        imgData.data[idx + 3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+
+  // ============================================================
+  // RENDERING: Draw detailed heatmap with token axis labels
+  // ============================================================
+  function drawDetailHeatmap(layerIdx, headIdx) {
+    var matrix = DATA.layers[layerIdx].attn_weights[headIdx];
+    var margin = 50;
+    var cellSz = Math.max(4, Math.floor(250 / T));
+    var gridSz = cellSz * T;
+
+    detailCanvas.width  = margin + gridSz + 4;
+    detailCanvas.height = margin + gridSz + 4;
+
+    var ctx = detailCanvas.getContext("2d");
+    ctx.fillStyle = "#1e293b";
+    ctx.fillRect(0, 0, detailCanvas.width, detailCanvas.height);
+
+    // Heatmap cells
+    for (var r = 0; r < T; r++) {
+      for (var c = 0; c < T; c++) {
+        var v = Math.max(0, Math.min(1, matrix[r][c]));
+        var red   = Math.round(255 * (1 - v));
+        var green = Math.round(255 * (1 - v));
+        var blue  = Math.round(255 * (1 - v * 0.5));
+        ctx.fillStyle = "rgb(" + red + "," + green + "," + blue + ")";
+        ctx.fillRect(margin + c * cellSz, margin + r * cellSz, cellSz - 1, cellSz - 1);
+      }
+    }
+
+    // Query labels (left, rows)
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "10px monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (var r2 = 0; r2 < T; r2++) {
+      var ql = tokens[r2];
+      if (ql.length > 6) ql = ql.slice(0, 5) + "\u2026";
+      ctx.fillText(ql, margin - 3, margin + r2 * cellSz + cellSz / 2);
+    }
+
+    // Key labels (top, columns — rotated)
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    for (var c2 = 0; c2 < T; c2++) {
+      var kl = tokens[c2];
+      if (kl.length > 6) kl = kl.slice(0, 5) + "\u2026";
+      ctx.save();
+      ctx.translate(margin + c2 * cellSz + cellSz / 2, margin - 3);
+      ctx.rotate(-Math.PI / 4);
+      ctx.fillText(kl, 0, 0);
+      ctx.restore();
+    }
+
+    // Axis titles
+    ctx.fillStyle = "#64748b";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Key position", margin + gridSz / 2, margin + gridSz + 16);
+    ctx.save();
+    ctx.translate(10, margin + gridSz / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("Query position", 0, 0);
+    ctx.restore();
+  }
+
+  // ============================================================
+  // STATE MANAGEMENT
+  // ============================================================
+  function goToLayer(idx) {
+    if (idx < -1) idx = -1;
+    if (idx >= nLayers) idx = nLayers - 1;
+    currentLayer = idx;
+    updateAll();
+  }
+
+  function updateAll() {
+    updateArch();
+    updateGrid();
+    updateAct();
+    updateProgress();
+    updateDetail();
+  }
+
+  // ── Update architecture panel ──
+  function updateArch() {
+    var embed = archNode("embed");
+    embed.className = "nv-arch-node " + (currentLayer >= 0 ? "done" : "active");
+
+    for (var i = 0; i < nLayers; i++) {
+      var node  = archNode("block-" + i);
+      var shape = shapeSpan(i);
+      if (i < currentLayer) {
+        node.className = "nv-arch-node done";
+      } else if (i === currentLayer) {
+        node.className = "nv-arch-node active";
+        node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } else {
+        node.className = "nv-arch-node upcoming";
+      }
+      // Shape annotation for revealed layers
+      if (i <= currentLayer && DATA.layers[i].shapes) {
+        shape.textContent = DATA.layers[i].shapes.input || "";
+      } else {
+        shape.textContent = "";
+      }
+    }
+
+    var normN = archNode("norm");
+    var lmN   = archNode("lmhead");
+    if (currentLayer >= nLayers - 1) {
+      normN.className = "nv-arch-node done";
+      lmN.className   = "nv-arch-node done";
+    } else {
+      normN.className = "nv-arch-node upcoming";
+      lmN.className   = "nv-arch-node upcoming";
+    }
+  }
+
+  // ── Update attention grid canvases ──
+  function updateGrid() {
+    for (var l = 0; l < nLayers; l++) {
+      for (var h = 0; h < nHeads; h++) {
+        var e = cellCanvases[l][h];
+        if (l <= currentLayer) {
+          e.cell.classList.remove("unfilled");
+          e.cell.classList.add("filled");
+          drawHeatmap(e.ctx, DATA.layers[l].attn_weights[h], T, T);
+        } else {
+          e.cell.classList.add("unfilled");
+          e.cell.classList.remove("filled");
+          e.ctx.fillStyle = "#0c1322";
+          e.ctx.fillRect(0, 0, T, T);
+        }
+      }
+    }
+  }
+
+  // ── Update activation norm bars ──
+  function updateAct() {
+    var maxNorm = 1;
+    for (var i = 0; i < nLayers; i++) {
+      if (DATA.layers[i].hidden_norm > maxNorm) maxNorm = DATA.layers[i].hidden_norm;
+    }
+    for (var j = 0; j < nLayers; j++) {
+      var norm = DATA.layers[j].hidden_norm;
+      if (j <= currentLayer) {
+        var pct = (norm / maxNorm) * 100;
+        actBars[j].style.width = pct + "%";
+        var ratio = norm / maxNorm;
+        var color;
+        if (ratio < 0.5)      color = "var(--accent-green)";
+        else if (ratio < 0.8) color = "var(--accent-amber)";
+        else                   color = "var(--accent-red)";
+        actBars[j].style.backgroundColor = color;
+        actVals[j].textContent = norm.toFixed(1);
+      } else {
+        actBars[j].style.width = "0%";
+        actVals[j].textContent = "--";
+      }
+    }
+  }
+
+  // ── Update progress text ──
+  function updateProgress() {
+    if (currentLayer < 0) {
+      progressTxt.textContent = "Ready \u2014 " + T + " tokens, " +
+        nLayers + " layers \u00d7 " + nHeads + " heads";
+    } else {
+      progressTxt.textContent = "Layer " + (currentLayer + 1) + "/" +
+        nLayers + " \u2014 Block " + currentLayer;
+    }
+  }
+
+  // ── Close detail if its layer scrolled out ──
+  function updateDetail() {
+    if (selectedCell && selectedCell.layer > currentLayer) {
+      closeDetail();
+    }
+  }
+
+  // ============================================================
+  // DETAIL PANEL — click interaction
+  // ============================================================
+  function onCellClick(e) {
+    var cell = e.currentTarget;
+    var l = parseInt(cell.dataset.layer, 10);
+    var h = parseInt(cell.dataset.head, 10);
+
+    // Ignore unfilled cells
+    if (l > currentLayer) return;
+
+    // Toggle: click same cell again to close
+    if (selectedCell && selectedCell.layer === l && selectedCell.head === h) {
+      closeDetail();
+      return;
+    }
+
+    // Deselect previous
+    if (selectedCell) {
+      cellCanvases[selectedCell.layer][selectedCell.head].cell.classList.remove("selected");
+    }
+
+    selectedCell = { layer: l, head: h };
+    cell.classList.add("selected");
+
+    // Highlight the corresponding architecture block
+    for (var i = 0; i < nLayers; i++) {
+      var node = archNode("block-" + i);
+      if (i === l) {
+        node.style.borderColor = "var(--accent-amber)";
+        node.style.boxShadow   = "var(--glow-amber)";
+      } else if (i <= currentLayer) {
+        node.style.borderColor = "var(--accent-blue)";
+        node.style.boxShadow   = "var(--glow-blue)";
+      } else {
+        node.style.borderColor = "";
+        node.style.boxShadow   = "";
+      }
+    }
+
+    // Render detail heatmap
+    drawDetailHeatmap(l, h);
+
+    // Build info HTML
+    var s = DATA.layers[l].shapes || {};
+    var info = "<h3>Layer " + l + ", Head " + h + "</h3>";
+    info += '<div class="nv-shape-line">Attn matrix: (' + T + " \u00d7 " + T + ")</div>";
+    if (s.q) info += '<div class="nv-shape-line">Q: ' + s.q + "</div>";
+    if (s.k) info += '<div class="nv-shape-line">K: ' + s.k + "</div>";
+    if (s.v) info += '<div class="nv-shape-line">V: ' + s.v + "</div>";
+    if (s.input)   info += '<div class="nv-shape-line">Input: ' + s.input + "</div>";
+    if (s.ffn_out) info += '<div class="nv-shape-line">FFN out: ' + s.ffn_out + "</div>";
+    info += '<div class="nv-shape-line" style="margin-top:6px;color:var(--text-dim);">' +
+      "Hidden norm: " + DATA.layers[l].hidden_norm.toFixed(2) + "</div>";
+    detailInfo.innerHTML = info;
+    detailPanel.classList.add("open");
+  }
+
+  function closeDetail() {
+    if (selectedCell) {
+      cellCanvases[selectedCell.layer][selectedCell.head].cell.classList.remove("selected");
+    }
+    selectedCell = null;
+    detailPanel.classList.remove("open");
+    // Restore architecture block styling to CSS-class-driven state
+    for (var i = 0; i < nLayers; i++) {
+      var node = archNode("block-" + i);
+      node.style.borderColor = "";
+      node.style.boxShadow   = "";
+    }
+    updateArch();
+  }
+
+  // ============================================================
+  // ANIMATION — play / pause / step / reset
+  // ============================================================
+  function getSpeed() { return parseInt(speedSlider.value, 10); }
+
+  function stepForward() {
+    if (currentLayer < nLayers - 1) {
+      goToLayer(currentLayer + 1);
+    } else if (chkLoop.checked) {
+      goToLayer(-1);
+      setTimeout(function() { goToLayer(0); }, 100);
+    } else {
+      stopPlaying();
+    }
+  }
+
+  function stepBackward() { goToLayer(currentLayer - 1); }
+
+  function startPlaying() {
+    if (playing) return;
+    playing = true;
+    btnPlay.innerHTML = "&#10074;&#10074; Pause";
+    if (currentLayer >= nLayers - 1) goToLayer(-1);
+    scheduleNext();
+  }
+
+  function stopPlaying() {
+    playing = false;
+    btnPlay.innerHTML = "&#9654; Play";
+    if (timer) { clearTimeout(timer); timer = null; }
+  }
+
+  function scheduleNext() {
+    if (!playing) return;
+    timer = setTimeout(function() {
+      stepForward();
+      if (playing) scheduleNext();
+    }, getSpeed());
+  }
+
+  function resetAnim() {
+    stopPlaying();
+    closeDetail();
+    goToLayer(-1);
+  }
+
+  // ============================================================
+  // EVENT WIRING
+  // ============================================================
+  btnPlay.addEventListener("click", function() {
+    playing ? stopPlaying() : startPlaying();
+  });
+  btnNext.addEventListener("click",  function() { stopPlaying(); stepForward(); });
+  btnPrev.addEventListener("click",  function() { stopPlaying(); stepBackward(); });
+  btnReset.addEventListener("click", resetAnim);
+  speedSlider.addEventListener("input", function() {
+    speedVal.textContent = (getSpeed() / 1000).toFixed(1) + "s";
+  });
+
+  // ============================================================
+  // BOOTSTRAP
+  // ============================================================
+  buildArchDiagram();
+  buildAttnGrid();
+  buildActBars();
+  goToLayer(-1);
+})();
+</script>
