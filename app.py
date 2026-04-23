@@ -2,7 +2,7 @@
 
 A single browser app with seven tabs:
   1. Generate      — live token streaming; toggle KV cache on/off to see speed
-  2. Teach         — render the 16 step-by-step slides for a chosen prompt
+  2. Train Reports — render the 16 step-by-step slides for a chosen prompt
   3. Attention     — per-head heatmap + rollout for the current prompt
   4. Benchmark     — side-by-side generate() vs generate_fast() tok/s
   5. Train         — interactive training with LR / dropout / warmup sliders
@@ -60,6 +60,7 @@ from teach import (
     slide_16_param_breakdown,
 )
 from visualise import AttentionCapture, compute_attention_rollout, plot_attention_heatmap
+from visualize_anim import collect_viz_data
 import build_viz
 import effect_viz
 
@@ -192,7 +193,7 @@ def generate_stream(prompt, max_new_tokens, temperature, top_k, top_p, use_cache
 
 
 # ═══════════════════════════════════════════════════════════════
-# Tab 2: Teach (render 16 slides for any prompt)
+# Tab 4: Train Reports (render 16 slides for any prompt)
 # ═══════════════════════════════════════════════════════════════
 
 def render_teach(prompt, layer, head, query_pos, temperature, top_k, top_p):
@@ -577,6 +578,38 @@ def render_effect_panel(param: str) -> tuple[str, str]:
 # Tab 7: Build Steps (interactive tutorial)
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# Tab 7: Visualize (animated forward pass)
+# ═══════════════════════════════════════════════════════════════
+
+_VIZ_TEMPLATE = None  # Lazy-loaded
+
+
+def _get_viz_template() -> str:
+    """Load the HTML template once."""
+    global _VIZ_TEMPLATE
+    if _VIZ_TEMPLATE is None:
+        template_path = os.path.join(os.path.dirname(__file__), "templates", "visualize.html")
+        with open(template_path, "r", encoding="utf-8") as f:
+            _VIZ_TEMPLATE = f.read()
+    return _VIZ_TEMPLATE
+
+
+def render_visualization(prompt: str) -> str:
+    """Collect tensors and return the animated HTML visualization."""
+    import json
+    model, tokenizer, config = _require_loaded()
+    data = collect_viz_data(model, tokenizer, prompt, config)
+    template = _get_viz_template()
+    json_str = json.dumps(data)
+    html = template.replace("{{VIZ_DATA_JSON}}", json_str)
+    return html
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tab 8: Build Steps (12-step build tour)
+# ═══════════════════════════════════════════════════════════════
+
 # Step content: (title, body markdown, image-key or None)
 # image-key resolves via build_viz.render_all() for structural diagrams,
 # or via a small helper for the teach.py reused slides (step 2, 6, 8).
@@ -608,7 +641,7 @@ _BUILD_STEPS: list[tuple[str, str, str | None]] = [
         "**Gotcha — test corpus variety:** A corpus of `\"hello world. \" * 100` "
         "collapses into a **single** token after ~10 merges. BPE tests need real "
         "variation. The visual below shows one prompt tokenized (this is slide 01 "
-        "of the Teach tab, reused here).",
+        "of the Train Reports tab, reused here).",
         "teach_01",  # rendered from teach.py on demand
     ),
     (
@@ -661,7 +694,7 @@ _BUILD_STEPS: list[tuple[str, str, str | None]] = [
         "The `scatter` at the end of top-p looks fragile but is correct: "
         "`sorted_idx` is a permutation over ALL vocab positions, so every slot "
         "is written.\n\n"
-        "**This is slide 11 of the Teach tab** — watch 10 decode steps with the "
+        "**This is slide 11 of the Train Reports tab** — watch 10 decode steps with the "
         "top-5 candidates at each step and which one was sampled.",
         "teach_11",  # sampling rollout
     ),
@@ -876,8 +909,8 @@ def build_ui() -> gr.Blocks:
             "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
             "Tabs follow the build → train → explore workflow: "
-            "**Build Steps** → **Train** → **Effects** → **Teach** → "
-            "**Attention** → **Generate** → **Benchmark**."
+            "**Build Steps** → **Train** → **Effects** → **Train Reports** → "
+            "**Attention** → **Visualize** → **Generate** → **Benchmark**."
         )
         gr.Markdown(_STATUS)
 
@@ -948,7 +981,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "**Trigger training from the UI and watch progress live.** "
                 "Training writes `checkpoints/best.pt` and `checkpoints/loss_curve.png`. "
-                "When it finishes, the Generate / Teach / Attention tabs pick up the "
+                "When it finishes, the Generate / Train Reports / Attention tabs pick up the "
                 "new model automatically — no restart. "
                 "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
             )
@@ -956,23 +989,23 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=1, min_width=280):
                     train_epochs = gr.Slider(
                         1, 30, value=10, step=1, label="max_epochs",
-                        info="Short (3-5) for demos, longer (10-20) for real runs.",
+                        info="How many full passes through the dataset. Too few = underfit, too many = overfit. Watch the val_loss to find the sweet spot.",
                     )
                     train_batch = gr.Slider(
                         8, 128, value=64, step=8, label="batch_size",
-                        info="Lower this if you hit OOM (8-16 for small GPUs).",
+                        info="Sequences processed in parallel per step. Larger = smoother gradients but more memory. Lower (8-16) if you hit OOM.",
                     )
                     train_lr = gr.Slider(
                         1e-5, 1e-3, value=3e-4, step=1e-5, label="learning_rate",
-                        info="Peak LR after warmup. 3e-4 is the AdamW standard.",
+                        info="Peak learning rate after warmup. Controls step size during gradient descent. Too high = unstable, too low = slow convergence. 3e-4 is the AdamW standard.",
                     )
                     train_dropout = gr.Slider(
                         0.0, 0.4, value=0.1, step=0.05, label="dropout",
-                        info="Increase (0.2-0.3) to fight overfitting.",
+                        info="Randomly zeroes this fraction of activations during training. Regularization that prevents overfitting — the model can't rely on any single neuron.",
                     )
                     train_warmup = gr.Slider(
                         0, 500, value=0, step=10, label="warmup_steps",
-                        info="0 = auto-scale (10% of total steps, recommended).",
+                        info="Steps where LR ramps from 0 to peak before cosine decay. Prevents early gradient explosion. 0 = auto-scale to 10% of total steps.",
                     )
                     train_btn = gr.Button("Start training", variant="primary", size="lg")
                     train_status = gr.Textbox(
@@ -1016,6 +1049,7 @@ def build_ui() -> gr.Blocks:
                         value=effect_viz.PARAMS[0],
                         label="Parameter",
                         interactive=True,
+                        info="Select a hyperparameter to see its schematic effect on training and validation loss curves.",
                     )
                     effect_caption = gr.Markdown()
                 with gr.Column(scale=2):
@@ -1039,27 +1073,53 @@ def build_ui() -> gr.Blocks:
                 outputs=[effect_caption, effect_img],
             )
 
-        # ── Tab 4: Teach (step-by-step forward pass) ──
-        with gr.Tab("Teach"):
+        # ── Tab 4: Train Reports (step-by-step forward pass) ──
+        with gr.Tab("Train Reports"):
             gr.Markdown(
-                "Render the 16 step-by-step slides on-the-fly for any prompt. "
-                "Changing `layer` / `head` / `query_pos` re-renders slides 02–09 for "
-                "that specific slice of the model. Aligned with Raschka's "
+                "### 16-slide visual walkthrough of a single forward pass\n\n"
+                "Each slide reveals one stage of how the model processes your prompt — "
+                "from raw text through tokenization, embeddings, Q/K/V projections, "
+                "attention scores, causal masking, softmax, residual connections, "
+                "the FFN layer, and finally the output logits and sampling.\n\n"
+                "**How to use:** Enter a prompt and click *Render*. Adjust "
+                "`layer` / `head` / `query_pos` to see how different parts of the "
+                "model attend to different tokens. Slides 02–09 update when you "
+                "change these controls.\n\n"
+                "Aligned with Raschka's "
                 "*Build a Large Language Model (From Scratch)* — see `REFERENCES.md`."
             )
             with gr.Row():
                 with gr.Column(scale=1):
                     teach_prompt = gr.Textbox(
                         label="Prompt", value="The cat sat on the", lines=2,
+                        info="The text the model will process. Try short phrases to see clear patterns.",
                     )
-                    teach_layer = gr.Slider(0, n_layers - 1, 0, step=1, label="layer")
-                    teach_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
-                    teach_qpos = gr.Number(value=-1, precision=0,
-                                           label="query_pos (-1 = last token)")
+                    teach_layer = gr.Slider(
+                        0, n_layers - 1, 0, step=1, label="layer",
+                        info=f"Which transformer block (0–{n_layers-1}). Early layers capture syntax, later layers capture semantics.",
+                    )
+                    teach_head = gr.Slider(
+                        0, n_heads - 1, 0, step=1, label="head",
+                        info=f"Which attention head (0–{n_heads-1}). Each head learns to attend to different token relationships.",
+                    )
+                    teach_qpos = gr.Number(
+                        value=-1, precision=0,
+                        label="query_pos (-1 = last token)",
+                        info="Which token position is 'asking the question'. -1 means the last token (most common for generation).",
+                    )
                     with gr.Row():
-                        teach_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05, label="temp")
-                        teach_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
-                        teach_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05, label="top_p")
+                        teach_temp = gr.Slider(
+                            0.05, 2.0, 0.8, step=0.05, label="temp",
+                            info="Sampling temperature. Lower = more deterministic, higher = more creative.",
+                        )
+                        teach_topk = gr.Slider(
+                            0, 200, 40, step=1, label="top_k",
+                            info="Only consider the top-k most likely tokens. 0 = disabled.",
+                        )
+                        teach_topp = gr.Slider(
+                            0.05, 1.0, 0.9, step=0.05, label="top_p",
+                            info="Nucleus sampling: keep tokens until cumulative probability reaches top_p.",
+                        )
                     teach_btn = gr.Button("Render 16 slides", variant="primary")
                     teach_status = gr.Markdown()
                 with gr.Column(scale=2):
@@ -1077,19 +1137,48 @@ def build_ui() -> gr.Blocks:
         # ── Tab 5: Attention (per-head heatmaps) ──
         with gr.Tab("Attention"):
             gr.Markdown(
-                "Heatmap view: one head's attention matrix + the attention rollout "
-                "across all layers (Abnar & Zuidema 2020). "
-                "Rows = query position, columns = key position. "
-                "Bright cells = strong attention."
+                "### Attention heatmaps — what tokens attend to what\n\n"
+                "Self-attention is the core mechanism that lets each token 'look at' "
+                "every earlier token to decide what information to carry forward. "
+                "This tab visualizes those attention weights directly.\n\n"
+                "**Left (Single head):** One attention head's weight matrix after "
+                "softmax + causal masking. Rows = query token (the one 'looking'), "
+                "columns = key token (the one being 'looked at'). "
+                "Bright = strong attention. The lower triangle is zero because "
+                "causal masking prevents tokens from attending to future positions.\n\n"
+                "**Right (Rollout):** Attention rollout across all layers "
+                "(Abnar & Zuidema 2020) — approximates how information flows from "
+                "input tokens to the final output across the *entire* model depth, "
+                "not just one layer.\n\n"
+                "**What the sliders do:**\n"
+                "- **layer:** The model has {n_layers} stacked transformer blocks. "
+                "Layer 0 (first) typically learns surface patterns — positional attention, "
+                "punctuation, local word relationships. Higher layers learn increasingly "
+                "abstract features — syntax, semantic roles, long-range dependencies. "
+                "Changing the layer shows you a completely different stage of processing.\n"
+                "- **head:** Each layer has {n_heads} parallel attention heads. "
+                "Each head independently learns to focus on different types of relationships "
+                "— one head might track subject-verb agreement, another might attend to "
+                "the previous word, another to sentence boundaries. Changing the head shows "
+                "you a different 'lens' on the same layer.\n\n"
+                "**Try:** Compare layer 0 head 0 vs layer {n_layers_m1} head 0 to see "
+                "how attention evolves from shallow to deep."
+                .format(n_layers=n_layers, n_heads=n_heads, n_layers_m1=n_layers - 1)
             )
             with gr.Row():
                 with gr.Column(scale=1):
                     attn_prompt = gr.Textbox(
                         label="Prompt", value="To be or not to be", lines=2,
+                        info="Shorter prompts produce clearer heatmaps (5-10 tokens ideal).",
                     )
-                    attn_layer = gr.Slider(0, n_layers - 1, n_layers // 2,
-                                           step=1, label="layer")
-                    attn_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
+                    attn_layer = gr.Slider(
+                        0, n_layers - 1, n_layers // 2, step=1, label="layer",
+                        info=f"Layer 0 = surface patterns, layer {n_layers-1} = deep semantics. Changes the left heatmap.",
+                    )
+                    attn_head = gr.Slider(
+                        0, n_heads - 1, 0, step=1, label="head",
+                        info=f"Each of the {n_heads} heads learns different attention patterns. Changes the left heatmap.",
+                    )
                     attn_btn = gr.Button("Render attention", variant="primary")
                     attn_status = gr.Markdown()
                 with gr.Column(scale=2):
@@ -1102,28 +1191,75 @@ def build_ui() -> gr.Blocks:
                 outputs=[attn_head_img, attn_rollout_img, attn_status],
             )
 
-        # ── Tab 6: Generate (interactive text generation) ──
+        # ── Tab 6: Visualize (animated forward pass) ──
+        with gr.Tab("Visualize"):
+            gr.Markdown(
+                "### Animated forward pass — watch data flow through the transformer\n\n"
+                "Enter a prompt and click **Visualize** to see a synchronized animation of:\n"
+                "- **Left:** Architecture diagram — each layer lights up as data flows through\n"
+                "- **Center:** 6×6 attention grid — every head's attention pattern, revealed layer by layer\n"
+                "- **Right:** Activation flow — hidden state magnitude at each layer\n\n"
+                "Click any cell in the attention grid to see the full-size heatmap and tensor shapes. "
+                "Use the playback controls (Play/Pause/Step) to control the animation speed."
+            )
+            viz_prompt = gr.Textbox(
+                label="Prompt", value="To be or not to be",
+                lines=1, max_lines=2,
+                info="Text to process. Shorter prompts (5-10 tokens) produce clearer visualizations.",
+            )
+            viz_btn = gr.Button("Visualize forward pass", variant="primary")
+            viz_html = gr.HTML(label="Visualization")
+
+            viz_btn.click(
+                render_visualization,
+                inputs=[viz_prompt],
+                outputs=[viz_html],
+            )
+
+        # ── Tab 7: Generate (interactive text generation) ──
         with gr.Tab("Generate"):
             gr.Markdown(
+                "### Interactive text generation\n\n"
+                "The model predicts one token at a time, appending each prediction to "
+                "the prompt and feeding it back in. The three sampling parameters "
+                "(`temperature`, `top_k`, `top_p`) control *how* the next token is "
+                "chosen from the model's probability distribution — they don't change "
+                "the model itself, just how creative vs. deterministic the output is.\n\n"
                 "**Tip:** Toggle the KV cache off to see the slower no-cache path "
-                "(the reference implementation used in most tutorials)."
+                "(the reference implementation used in most tutorials). "
+                "With cache on, each new token only computes attention against the "
+                "cached K/V from previous tokens — O(T) instead of O(T²)."
             )
             with gr.Row():
                 with gr.Column(scale=2):
                     gen_prompt = gr.Textbox(
                         label="Prompt", value="To be or not to be, ",
                         lines=2, max_lines=4,
+                        info="Starting text the model continues from. The model has only seen Shakespeare during training.",
                     )
                     with gr.Row():
-                        gen_max = gr.Slider(8, max_seq - 1, 100, step=1,
-                                            label="max_new_tokens")
+                        gen_max = gr.Slider(
+                            8, max_seq - 1, 100, step=1,
+                            label="max_new_tokens",
+                            info="How many tokens to generate. Longer = slower but more text. Limited by the 256-token context window.",
+                        )
                     with gr.Row():
-                        gen_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05,
-                                             label="temperature")
-                        gen_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
-                        gen_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05,
-                                             label="top_p (nucleus)")
-                    gen_cache = gr.Checkbox(True, label="Use KV cache (generate_fast)")
+                        gen_temp = gr.Slider(
+                            0.05, 2.0, 0.8, step=0.05, label="temperature",
+                            info="Scales the logits before softmax. <1 = sharper (more repetitive), >1 = flatter (more random). 0.8 is a good default.",
+                        )
+                        gen_topk = gr.Slider(
+                            0, 200, 40, step=1, label="top_k",
+                            info="Keep only the top-k most probable tokens, zero out the rest. 0 = disabled (consider all tokens). Prevents rare gibberish.",
+                        )
+                        gen_topp = gr.Slider(
+                            0.05, 1.0, 0.9, step=0.05, label="top_p (nucleus)",
+                            info="Keep the smallest set of tokens whose cumulative probability exceeds top_p. Adapts dynamically — broad when uncertain, narrow when confident.",
+                        )
+                    gen_cache = gr.Checkbox(
+                        True, label="Use KV cache (generate_fast)",
+                        info="ON: reuses past K/V vectors (fast, O(T) per step). OFF: recomputes full attention each step (slow, O(T²)) — educational comparison.",
+                    )
                     gen_btn = gr.Button("Generate", variant="primary")
                 with gr.Column(scale=3):
                     gen_out = gr.Textbox(
@@ -1135,20 +1271,31 @@ def build_ui() -> gr.Blocks:
                 outputs=gen_out,
             )
 
-        # ── Tab 7: Benchmark (cache vs no-cache comparison) ──
+        # ── Tab 8: Benchmark (cache vs no-cache comparison) ──
         with gr.Tab("Benchmark"):
             gr.Markdown(
-                "Compare `generate()` (no cache, O(T²) per step) vs "
-                "`generate_fast()` (KV cache, O(T) per step). "
-                "Speedup grows with sequence length."
+                "### KV cache speedup — why caching matters\n\n"
+                "Compares two generation strategies side by side:\n"
+                "- **`generate()`** — no cache. Every new token recomputes attention "
+                "over *all* previous tokens from scratch. Cost: O(T²) per step.\n"
+                "- **`generate_fast()`** — KV cache. Stores each layer's K and V "
+                "tensors from previous steps and only computes the new token's "
+                "attention. Cost: O(T) per step.\n\n"
+                "The speedup grows with sequence length — at 200 tokens the cached "
+                "version can be 5-10x faster. This is how production LLMs (GPT, LLaMA, "
+                "Claude) achieve fast inference."
             )
             with gr.Row():
                 with gr.Column(scale=1):
                     bench_prompt = gr.Textbox(
                         label="Prompt", value="The ", lines=1,
+                        info="Short prompt to seed generation. The benchmark measures the generation speed, not prompt processing.",
                     )
-                    bench_n = gr.Slider(20, max_seq - 10, 100, step=10,
-                                        label="tokens to generate")
+                    bench_n = gr.Slider(
+                        20, max_seq - 10, 100, step=10,
+                        label="tokens to generate",
+                        info="More tokens = bigger speedup gap between cached and uncached. Try 200 for dramatic results.",
+                    )
                     bench_btn = gr.Button("Run benchmark", variant="primary")
                     bench_summary = gr.Code(
                         label="Result", language=None, interactive=False,
