@@ -1,7 +1,8 @@
 """LLM101 Training Loop.
 
 Features:
-  • bf16 mixed-precision (RTX 4080 supports bf16 natively)
+  • torch.compile on CPU (~1.5-2× speedup, automatic with progress)
+  • bf16 mixed-precision when CUDA is available
   • AdamW with decoupled weight decay
   • Linear warmup + cosine decay LR schedule
   • Gradient clipping
@@ -76,35 +77,38 @@ def save_loss_curve(train_history, epoch_history, path):
     except ImportError:
         return False
 
-    if not train_history or not epoch_history:
+    if not train_history:
         return False
 
-    steps_per_epoch = train_history[-1][0] / max(len(epoch_history), 1)
+    try:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        steps = [s for s, _ in train_history]
+        losses = [l for _, l in train_history]
+        ax.plot(steps, losses, color="#9ecae1", linewidth=0.7,
+                label="Train (per step)", alpha=0.6)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    steps = [s for s, _ in train_history]
-    losses = [l for _, l in train_history]
-    ax.plot(steps, losses, color="#9ecae1", linewidth=0.7,
-            label="Train (per step)", alpha=0.6)
+        if epoch_history:
+            steps_per_epoch = train_history[-1][0] / max(len(epoch_history), 1)
+            ep_steps = [e * steps_per_epoch for e, _, _ in epoch_history]
+            train_avgs = [t for _, t, _ in epoch_history]
+            val_avgs = [v for _, _, v in epoch_history]
+            ax.plot(ep_steps, train_avgs, "o-", color="#08519c", linewidth=2,
+                    markersize=7, label="Train (epoch avg)")
+            ax.plot(ep_steps, val_avgs, "s-", color="#cb181d", linewidth=2,
+                    markersize=7, label="Validation")
 
-    ep_steps = [e * steps_per_epoch for e, _, _ in epoch_history]
-    train_avgs = [t for _, t, _ in epoch_history]
-    val_avgs = [v for _, _, v in epoch_history]
-    ax.plot(ep_steps, train_avgs, "o-", color="#08519c", linewidth=2,
-            markersize=7, label="Train (epoch avg)")
-    ax.plot(ep_steps, val_avgs, "s-", color="#cb181d", linewidth=2,
-            markersize=7, label="Validation")
-
-    ax.set_xlabel("Global step", fontsize=11)
-    ax.set_ylabel("Cross-entropy loss (log scale)", fontsize=11)
-    ax.set_yscale("log")
-    ax.set_title("LLM101 training curve", fontsize=13, fontweight="bold")
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.grid(True, which="both", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    return True
+        ax.set_xlabel("Global step", fontsize=11)
+        ax.set_ylabel("Cross-entropy loss (log scale)", fontsize=11)
+        ax.set_yscale("log")
+        ax.set_title("LLM101 training curve", fontsize=13, fontweight="bold")
+        ax.legend(loc="upper right", framealpha=0.9)
+        ax.grid(True, which="both", alpha=0.3)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        return True
+    except Exception:
+        plt.close()
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -213,6 +217,37 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
 
     # ── Model & optimizer ──
     model = NanoLLM(config).to(device)
+
+    # ── torch.compile — fuses ops for ~1.5-2× CPU speedup ──────────
+    # Only worth the ~60s compile cost for models large enough to benefit.
+    # Tiny test models (d_model=32, 2 layers) skip this automatically.
+    compiled = False
+    n_params = sum(p.numel() for p in model.parameters())
+    if hasattr(torch, "compile") and n_params > 1_000_000:
+        yield {"type": "log",
+               "msg": "Compiling model (torch.compile) — one-time ~60s cost "
+                      "that pays back ~1.5-2× faster steps..."}
+        t_compile = time.time()
+        try:
+            model = torch.compile(model)
+            # Trigger compilation with a dummy forward pass so the cost
+            # is visible here, not buried inside the first training step.
+            _dummy = torch.randint(0, config.vocab_size,
+                                   (2, config.max_seq_len), device=device)
+            with torch.no_grad():
+                model(_dummy)
+            del _dummy
+            compile_secs = time.time() - t_compile
+            compiled = True
+            yield {"type": "log",
+                   "msg": f"Compilation done in {compile_secs:.0f}s — "
+                          f"training steps will be faster."}
+        except Exception as e:
+            compile_secs = time.time() - t_compile
+            yield {"type": "log",
+                   "msg": f"torch.compile failed ({e}) — "
+                          f"continuing without compilation."}
+
     decay_params, no_decay_params = [], []
     for _, param in model.named_parameters():
         if not param.requires_grad:
@@ -321,11 +356,15 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
                "samples": samples}
 
         # ── Checkpoint ──
+        # Always save the *unwrapped* state_dict so checkpoints load
+        # cleanly into uncompiled models (torch.compile prefixes keys
+        # with "_orig_mod." which breaks plain load_state_dict).
+        raw_model = getattr(model, "_orig_mod", model)
         if epoch % config.save_interval == 0 or val_loss < best_val_loss:
             ckpt_path = os.path.join(config.checkpoint_dir, f"epoch_{epoch:03d}.pt")
             torch.save({
                 "epoch": epoch, "global_step": global_step,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": avg_loss, "val_loss": val_loss, "config": config,
             }, ckpt_path)
@@ -334,7 +373,7 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
                 best_path = os.path.join(config.checkpoint_dir, "best.pt")
                 torch.save({
                     "epoch": epoch, "global_step": global_step,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": raw_model.state_dict(),
                     "loss": avg_loss, "val_loss": val_loss, "config": config,
                 }, best_path)
                 yield {"type": "best", "epoch": epoch,

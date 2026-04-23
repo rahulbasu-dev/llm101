@@ -101,7 +101,6 @@ def draw_sliding_window(path):
             "Each (input, target) pair trains the model to predict the NEXT token at every position.",
             ha="center", fontsize=10, style="italic", color="#333")
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -170,7 +169,6 @@ def draw_transformer_block(path):
             "(SwiGLU uses 3 matmuls vs 2, so shrink hidden to keep param count).",
             ha="center", fontsize=9, style="italic", color="#444")
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -240,7 +238,6 @@ def draw_kv_cache_flow(path):
 
     fig.suptitle("Step 7 — KV cache: prefill then decode",
                  fontsize=13, fontweight="bold", y=1.02)
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -286,7 +283,6 @@ def draw_ui_layout(path):
             "zero I/O, sub-second UI smoke tests.",
             ha="center", fontsize=9, style="italic", color="#444")
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -333,7 +329,6 @@ def draw_test_matrix(path):
     ax.text(5, -0.5, "Total: 48 tests · 42 unit + 6 UI smoke · pytest fixtures in conftest.py",
             ha="center", fontsize=10, fontweight="bold", color="#333")
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -361,7 +356,6 @@ def draw_config_summary(path):
     ax.set_xlabel("value (log scale)")
     ax.grid(True, axis="x", alpha=0.3)
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
@@ -401,7 +395,6 @@ def draw_training_schematic(path):
     ax.legend(loc="upper right")
     ax.grid(True, which="both", alpha=0.3)
 
-    plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 

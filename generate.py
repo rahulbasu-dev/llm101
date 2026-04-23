@@ -28,7 +28,10 @@ def load_model(checkpoint_path: str, device: torch.device):
     config.vocab_size = tokenizer.vocab_size
 
     model = NanoLLM(config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in sd):
+        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     model.eval()
 
     epoch = ckpt.get("epoch", "?")

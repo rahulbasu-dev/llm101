@@ -60,6 +60,20 @@ def _get_plt():
         sys.exit(1)
 
 
+def _safe_tight_layout(**kwargs):
+    """tight_layout() that silently falls back when fonts are missing.
+
+    WSL2 without fonts-dejavu-core triggers a ParseException inside
+    matplotlib's mathtext parser.  savefig(bbox_inches='tight') still
+    works, so this is a best-effort nicety.
+    """
+    import matplotlib.pyplot as plt
+    try:
+        plt.tight_layout(**kwargs)
+    except (ValueError, Exception):
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════
 # Hook-based tensor capture
 # ═══════════════════════════════════════════════════════════════
@@ -157,7 +171,10 @@ def load_model(checkpoint_path, device):
         tokenizer.load(config.tokenizer_path)
         config.vocab_size = tokenizer.vocab_size
         model = NanoLLM(config).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        sd = ckpt["model_state_dict"]
+        if any(k.startswith("_orig_mod.") for k in sd):
+            sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        model.load_state_dict(sd)
         model.eval()
         print(f"Loaded epoch {ckpt.get('epoch', '?')}")
         return model, tokenizer, config
@@ -254,7 +271,7 @@ def slide_01_tokenization(plt, tokenizer, text, token_ids, out_path):
             "Green = BPE merge token (learned)  |  Red = single byte (base vocab)",
             fontsize=9, color="#555", style="italic")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    _safe_tight_layout(rect=[0, 0, 1, 0.92])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -286,7 +303,7 @@ def slide_02_embeddings(plt, store, labels, out_path):
     ax.set_xlabel(f"Embedding dimension (first {show_d} of {d})")
     ax.set_ylabel("Token")
     plt.colorbar(im, ax=ax, shrink=0.8)
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    _safe_tight_layout(rect=[0, 0, 1, 0.92])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -310,7 +327,7 @@ def slide_03_qkv(plt, store, labels, head, out_path):
         ax.set_title(name, fontsize=12, fontweight="bold")
         ax.set_xlabel(f"d_head = {d_head}")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -329,7 +346,7 @@ def slide_04_scores_raw(plt, store, labels, head, out_path):
     ax.set_xlabel("Key  (token j)")
     ax.set_ylabel("Query  (token i)")
     plt.colorbar(im, ax=ax, shrink=0.8)
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -359,7 +376,7 @@ def slide_05_scores_masked(plt, store, labels, head, out_path):
     ax.set_xlabel("Key (token j)")
     ax.set_ylabel("Query (token i)")
     plt.colorbar(im, ax=ax, shrink=0.8)
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -384,7 +401,7 @@ def slide_06_attn_weights(plt, store, labels, head, out_path):
         ax.text(j, i, "*", ha="center", va="center", color="white",
                 fontsize=12, fontweight="bold")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -425,7 +442,7 @@ def slide_07_value_sum(plt, store, labels, head, query_pos, out_path):
                       fontsize=10)
     plt.colorbar(im, ax=axes[1], shrink=0.8)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    _safe_tight_layout(rect=[0, 0, 1, 0.92])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -455,7 +472,7 @@ def slide_08_all_heads(plt, store, labels, out_path):
     for h in range(n_heads, len(axes)):
         axes[h].axis("off")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    _safe_tight_layout(rect=[0, 0, 1, 0.93])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -487,7 +504,7 @@ def slide_09_ffn_delta(plt, store, labels, out_path):
         ax.set_xlabel(f"first {show_d} dims")
         plt.colorbar(im, ax=ax, shrink=0.7)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -531,7 +548,7 @@ def slide_10_logits_topk(plt, model, tokenizer, idx, device, temperature, top_k,
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -597,7 +614,7 @@ def slide_11_sampling_rollout(plt, model, tokenizer, idx, device, temperature, t
             transform=ax.transAxes, ha="center", fontsize=10,
             style="italic", color="#333")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -667,7 +684,7 @@ def slide_12_positional_rope(plt, model, out_path):
     ax3.set_title(f"Unit (1,0) rotated by pos (dim pair {pair_i})",
                   fontsize=11, fontweight="bold")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -714,7 +731,7 @@ def slide_13_scaling_rationale(plt, out_path):
         max_p = soft_scaled.max()
         ax_bot.set_xlabel(f"max entry = {max_p:.2f}", fontsize=9)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -751,7 +768,7 @@ def slide_14_temperature_effect(plt, model, tokenizer, idx, out_path):
         ax.set_ylabel("probability")
         ax.grid(True, axis="y", alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -807,7 +824,7 @@ def slide_15_greedy_vs_sample(plt, model, tokenizer, idx, device, out_path):
             y -= 0.045
         y -= 0.03
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")
@@ -865,7 +882,7 @@ def slide_16_param_breakdown(plt, model, out_path):
     )
     ax.set_aspect("equal")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    _safe_tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  {out_path}")

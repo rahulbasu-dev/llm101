@@ -12,13 +12,84 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# ── Hardware Detection ─────────────────────────────────────
+# Probes for ML accelerators and sets:
+#   HW_ACCEL       — "nvidia" | "amd" | "cpu"
+#   HW_LABEL       — human-readable string for the banner
+#   HW_TORCH_INDEX — pip --index-url for the correct PyTorch build
+#   HW_NOTE        — optional advisory (e.g. NPU detected)
+detect_hw() {
+    HW_ACCEL="cpu"
+    HW_LABEL=""
+    HW_TORCH_INDEX=""
+    HW_NOTE=""
+
+    # 1. NVIDIA GPU — nvidia-smi works in WSL2 via Windows driver passthrough
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_csv
+        gpu_csv=$(nvidia-smi --query-gpu=name,memory.total \
+                  --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [ -n "$gpu_csv" ]; then
+            local gpu_name gpu_mem_mib gpu_mem_gb
+            gpu_name=$(echo "$gpu_csv" | cut -d',' -f1 | xargs)
+            gpu_mem_mib=$(echo "$gpu_csv" | cut -d',' -f2 | xargs)
+            gpu_mem_gb=$(( gpu_mem_mib / 1024 ))
+            HW_ACCEL="nvidia"
+            HW_LABEL="${gpu_name} (${gpu_mem_gb} GB VRAM)"
+            HW_TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+            return
+        fi
+    fi
+
+    # 2. AMD GPU with ROCm
+    if command -v rocminfo &>/dev/null; then
+        local amd_name
+        amd_name=$(rocminfo 2>/dev/null | grep -m1 "Marketing Name" \
+                   | sed 's/.*:\s*//' | xargs)
+        if [ -n "$amd_name" ]; then
+            HW_ACCEL="amd"
+            HW_LABEL="${amd_name} (ROCm)"
+            HW_TORCH_INDEX="https://download.pytorch.org/whl/rocm6.2"
+            return
+        fi
+    fi
+
+    # 3. CPU fallback — identify the processor and check for Intel NPU
+    local cpu_name
+    cpu_name=$(lscpu 2>/dev/null | grep -i "Model name" \
+               | sed 's/.*:\s*//' | xargs)
+    cpu_name="${cpu_name:-unknown CPU}"
+
+    # Intel NPU (Core Ultra / Meteor Lake / Arrow Lake / Lunar Lake).
+    # WSL2 doesn't expose NPU devices, but we infer from the CPU model.
+    if [ -d "/sys/class/accel" ] && \
+       ls /sys/class/accel/accel* &>/dev/null 2>&1; then
+        HW_NOTE="Intel NPU detected (not yet supported by PyTorch — using CPU)"
+    elif echo "$cpu_name" | grep -qiE "Core.*Ultra|Meteor.Lake|Arrow.Lake|Lunar.Lake"; then
+        HW_NOTE="Intel NPU likely present (not exposed in WSL2 — using CPU)"
+    fi
+
+    HW_LABEL="CPU — ${cpu_name}"
+    HW_TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+}
+
 banner() {
+    local sub="$HW_LABEL"
+    local len=${#sub}
+    [ "$len" -gt 48 ] && sub="${sub:0:48}" && len=48
+    local total=$(( 50 - len ))
+    local l=$(( total / 2 ))
+    local r=$(( total - l ))
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════╗"
     echo "║              LLM101 — Build Your LLM             ║"
-    echo "║     From Scratch on RTX 4080 (12GB VRAM)        ║"
+    printf '║%*s%s%*s║\n' "$l" '' "$sub" "$r" ''
     echo "╚══════════════════════════════════════════════════╝"
     echo -e "${NC}"
+    if [ -n "$HW_NOTE" ]; then
+        echo -e "${YELLOW}  ℹ ${HW_NOTE}${NC}"
+        echo
+    fi
 }
 
 # ── Setup ───────────────────────────────────────────────────
@@ -34,6 +105,12 @@ do_setup() {
     fi
 
     echo -e "${GREEN}[1/4] Python environment...${NC}"
+
+    # matplotlib needs fonts for plot text rendering; WSL2 often ships without them.
+    if ! fc-list 2>/dev/null | grep -qi dejavu; then
+        echo -e "${YELLOW}  Installing fonts for matplotlib (DejaVu)...${NC}"
+        sudo apt install -y fonts-dejavu-core >/dev/null 2>&1 || true
+    fi
 
     # Remove any partial / broken venv from a prior failed run (no activate
     # script means ensurepip failed and the directory is useless).
@@ -84,34 +161,37 @@ do_setup() {
         PIP="python3 -m pip"
     fi
 
-    echo -e "${GREEN}[2/4] Installing CUDA-enabled PyTorch (cu121) + deps...${NC}"
-    echo -e "${YELLOW}    (torch cu121 is ~2 GB — 3-10 min depending on connection)${NC}"
+    echo -e "${GREEN}[2/4] Installing PyTorch (${HW_ACCEL})...${NC}"
     $PIP install --upgrade pip -q
-    # CUDA-enabled build (cu121 — works with any RTX 3xxx/4xxx/5xxx GPU).
-    # LLM101 requires CUDA; see config.require_cuda().
-    # NOT using -q here: users need to see progress bars on the multi-GB
-    # torch download, otherwise the terminal looks frozen for minutes.
+    case "$HW_ACCEL" in
+        nvidia)
+            echo -e "${YELLOW}    CUDA-enabled build (cu121) — ~2 GB download${NC}" ;;
+        amd)
+            echo -e "${YELLOW}    ROCm-enabled build — ~2 GB download${NC}" ;;
+        *)
+            echo -e "${YELLOW}    CPU-only build — ~200 MB download${NC}"
+            echo -e "${YELLOW}    Training will work but is ~10× slower than GPU.${NC}" ;;
+    esac
+    # Show progress bars — the download can be multi-GB for GPU builds.
     $PIP install --upgrade torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu121
+        --index-url "$HW_TORCH_INDEX"
     $PIP install matplotlib numpy tqdm pytest -q
 
-    echo -e "${GREEN}[3/4] Verifying GPU...${NC}"
+    echo -e "${GREEN}[3/4] Verifying accelerator...${NC}"
     python3 -c "
-import sys, torch
-if '+cpu' in torch.__version__:
-    print('  ✗ ERROR: CPU-only torch installed (got ' + torch.__version__ + ')')
-    print('  ✗ LLM101 requires CUDA. Run: bash run.sh setup again.')
-    sys.exit(1)
-if not torch.cuda.is_available():
-    print('  ✗ ERROR: CUDA torch installed but no GPU detected.')
-    print('    - Check NVIDIA driver: run nvidia-smi')
-    print('    - Are you in WSL2 with GPU passthrough enabled?')
-    sys.exit(1)
-props = torch.cuda.get_device_properties(0)
-print(f'  ✓ GPU:  {props.name}')
-print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
-print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
-print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
+import torch, platform, multiprocessing
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print(f'  ✓ GPU:  {props.name}')
+    print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
+    print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
+    print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
+else:
+    cores = multiprocessing.cpu_count()
+    cpu = platform.processor() or 'unknown'
+    print(f'  ✓ torch {torch.__version__} (CPU mode)')
+    print(f'  ✓ CPU:  {cpu}  ·  Cores: {cores}')
+    print(f'  ℹ No GPU detected — training runs on CPU (slower but works)')
 "
 
     echo -e "${GREEN}[4/4] Downloading training data...${NC}"
@@ -202,39 +282,133 @@ do_ui() {
 do_verify() {
     source .venv/bin/activate 2>/dev/null || true
 
-    # Step 0: explicit CUDA probe — the smoke tests below pass on CPU torch,
-    # which hides whether the setup actually gave you GPU access.
-    echo -e "${GREEN}[1/3] GPU / CUDA check...${NC}"
+    echo -e "${GREEN}[1/4] Accelerator check...${NC}"
     python3 -c "
-import sys, torch
-if '+cpu' in torch.__version__:
-    print(f'  ✗ torch build: {torch.__version__} (CPU-only!)')
-    print('    Fix:  bash run.sh setup')
-    print('    (this re-runs the cu121 wheel install)')
-    sys.exit(1)
-if not torch.cuda.is_available():
-    print(f'  ✗ torch {torch.__version__} installed but no CUDA device detected.')
-    print('    - Check driver:  nvidia-smi')
-    print('    - In WSL2, the Windows NVIDIA driver exposes the GPU automatically.')
-    print('    - If nvidia-smi works but torch.cuda does not, re-install torch:')
-    print('        bash run.sh setup')
-    sys.exit(1)
-props = torch.cuda.get_device_properties(0)
-print(f'  ✓ GPU:  {props.name}')
-print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
-print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
-print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
-" || { echo -e "${YELLOW}  GPU check failed — fix the above before training.${NC}"; return 1; }
+import torch, platform, os, multiprocessing
+# ── Device ──
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print(f'  ✓ GPU:  {props.name}')
+    print(f'  ✓ VRAM: {props.total_memory / 1e9:.1f} GB')
+    print(f'  ✓ bf16: {torch.cuda.is_bf16_supported()}')
+    print(f'  ✓ CUDA: {torch.version.cuda} · torch {torch.__version__}')
+else:
+    cores = multiprocessing.cpu_count()
+    cpu = platform.processor() or 'unknown'
+    print(f'  ✓ torch {torch.__version__} (CPU mode)')
+    print(f'  ✓ CPU:  {cpu}')
+    print(f'  ✓ Cores: {cores}')
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / 1e9
+        print(f'  ✓ RAM:  {ram_gb:.1f} GB')
+    except ImportError:
+        pass
+    print(f'  ℹ No GPU — training runs on CPU')
+"
 
     echo
-    echo -e "${GREEN}[2/3] Model shape + KV-cache equivalence...${NC}"
+    echo -e "${GREEN}[2/4] Model shape + KV-cache equivalence...${NC}"
     python3 model.py
     echo
-    echo -e "${GREEN}[3/3] Tokenizer roundtrip...${NC}"
+    echo -e "${GREEN}[3/4] Tokenizer roundtrip...${NC}"
     python3 tokenizer.py
+    echo
+
+    echo -e "${GREEN}[4/4] Training time estimate...${NC}"
+    python3 -c "
+import time, sys, torch, os
+from config import NanoLLMConfig
+from model import NanoLLM
+
+config = NanoLLMConfig()
+config.vocab_size = config.target_vocab_size  # approximate for estimate
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = NanoLLM(config).to(device)
+model.train()
+
+# ── torch.compile (mirrors what train.py does) ──
+compiled = False
+if hasattr(torch, 'compile'):
+    print('  Compiling model (one-time cost)...', end='', flush=True)
+    t_comp = time.perf_counter()
+    try:
+        model = torch.compile(model)
+        _w = torch.randint(0, config.vocab_size, (2, config.max_seq_len), device=device)
+        with torch.no_grad():
+            model(_w)
+        del _w
+        comp_s = time.perf_counter() - t_comp
+        compiled = True
+        print(f' done in {comp_s:.0f}s')
+    except Exception as e:
+        print(f' skipped ({e})')
+
+B, T = config.batch_size, config.max_seq_len
+dummy = torch.randint(0, config.vocab_size, (B, T), device=device)
+
+# Warm-up pass
+logits, loss = model(dummy, targets=dummy)
+loss.backward()
+
+# Timed passes
+n_runs = 5
+torch.cuda.synchronize() if device.type == 'cuda' else None
+t0 = time.perf_counter()
+for _ in range(n_runs):
+    logits, loss = model(dummy, targets=dummy)
+    loss.backward()
+    torch.cuda.synchronize() if device.type == 'cuda' else None
+elapsed = (time.perf_counter() - t0) / n_runs
+
+# Estimate total training time from the corpus size
+corpus_path = config.data_path
+if os.path.exists(corpus_path):
+    corpus_chars = os.path.getsize(corpus_path)
+    est_tokens = int(corpus_chars / 4.0)  # rough char-to-token ratio
+else:
+    est_tokens = 280_000  # TinyShakespeare default
+
+train_tokens = int(est_tokens * 0.9)
+stride = config.max_seq_len // 2
+n_windows = max(1, (train_tokens - config.max_seq_len) // stride + 1)
+batches_per_epoch = max(1, n_windows // config.batch_size)
+total_steps = batches_per_epoch * config.max_epochs
+total_secs = total_steps * elapsed
+# Add compile overhead to the total (one-time cost during training)
+if compiled:
+    total_secs += comp_s
+
+label = 'compiled' if compiled else 'uncompiled'
+print(f'  Step time:   {elapsed:.3f}s  ({label}, batch={B}, seq_len={T})')
+print(f'  Steps/epoch: ~{batches_per_epoch}  ·  Epochs: {config.max_epochs}  ·  Total: ~{total_steps:,} steps')
+
+if total_secs < 120:
+    print(f'  ⏱ Estimated training: ~{total_secs:.0f} seconds')
+elif total_secs < 3600:
+    print(f'  ⏱ Estimated training: ~{total_secs/60:.0f} minutes')
+else:
+    h = int(total_secs // 3600)
+    m = int((total_secs % 3600) // 60)
+    print(f'  ⏱ Estimated training: ~{h}h {m}m')
+
+if device.type != 'cuda':
+    print()
+    print(f'  Tip: reduce epochs for a quick test run:')
+    print(f'    bash run.sh train --max-epochs 3')
+"
 }
 
 # ── Main ────────────────────────────────────────────────────
+detect_hw
+
+# Auto-enable CPU mode when no CUDA GPU is detected, so all Python
+# entry points (which call config.require_cuda()) work without manual
+# env vars.  Users running Python directly still get the CUDA gate.
+if [ "$HW_ACCEL" != "nvidia" ]; then
+    export NANOLLM_ALLOW_CPU=1
+fi
+
 banner
 
 case "${1:-help}" in
@@ -253,13 +427,13 @@ case "${1:-help}" in
         echo "Commands:"
         echo "  setup      Install dependencies + download training data"
         echo "  verify     Quick test — verify model shapes and tokenizer"
-        echo "  train      Train the LLM101 (takes ~5-15 min on RTX 4080)"
+        echo "  train      Train LLM101 (~5 min GPU, ~30 min CPU)"
         echo "  generate   Interactive text generation from trained model"
         echo "  visualise  Generate attention heatmaps (for webinar slides)"
         echo "  teach      Generate 16-slide step-by-step forward-pass walkthrough"
         echo "  benchmark  Compare generate() vs generate_fast() (KV-cache speedup)"
         echo "  test       Run pytest suite on mock data (CPU, no training data needed)"
-        echo "  ui         Launch Gradio webinar console (Generate/Teach/Attention/Benchmark tabs)"
+        echo "  ui         Launch Gradio webinar console (7-tab interface)"
         echo
         echo "Quick start:"
         echo "  bash run.sh setup"

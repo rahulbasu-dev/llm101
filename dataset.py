@@ -58,12 +58,19 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 2,
 ) -> DataLoader:
-    """Create a DataLoader with pinned memory for GPU transfer."""
+    """Create a DataLoader tuned for the available device.
+
+    pin_memory accelerates CPU→GPU transfers but wastes effort on
+    CPU-only training.  num_workers>0 can cause overhead on CPU when
+    there's no async GPU transfer to overlap with.
+    """
+    import torch
+    on_gpu = torch.cuda.is_available()
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
+        num_workers=num_workers if on_gpu else 0,
+        pin_memory=on_gpu,
         drop_last=True,  # Avoid incomplete last batch
     )

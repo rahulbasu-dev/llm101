@@ -1,13 +1,17 @@
 """LLM101 — Webinar Console (Gradio UI).
 
-A single browser app with four tabs:
+A single browser app with seven tabs:
   1. Generate      — live token streaming; toggle KV cache on/off to see speed
   2. Teach         — render the 16 step-by-step slides for a chosen prompt
   3. Attention     — per-head heatmap + rollout for the current prompt
   4. Benchmark     — side-by-side generate() vs generate_fast() tok/s
+  5. Train         — interactive training with LR / dropout / warmup sliders
+  6. Effects       — how each hyperparameter shapes the loss curve
+  7. Build Steps   — structural diagrams (no trained model needed)
 
-All four tabs reuse the existing teach.py / visualise.py plumbing — no logic
-is duplicated. The model is loaded once at startup.
+All tabs reuse the existing teach.py / visualise.py / build_viz.py /
+effect_viz.py plumbing — no logic is duplicated. The model is loaded once
+at startup.
 
 Run:
     python app.py
@@ -83,7 +87,12 @@ def _load_model(checkpoint_path: str = "checkpoints/best.pt") -> None:
         tokenizer.load(config.tokenizer_path)
         config.vocab_size = tokenizer.vocab_size
         model = NanoLLM(config).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        # Checkpoints saved from torch.compile'd models have keys prefixed
+        # with "_orig_mod." — strip that prefix so they load into a plain model.
+        sd = ckpt["model_state_dict"]
+        if any(k.startswith("_orig_mod.") for k in sd):
+            sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        model.load_state_dict(sd)
         model.eval()
 
         epoch = ckpt.get("epoch", "?")
@@ -383,7 +392,10 @@ def run_bench(prompt, n_tokens):
                 f"{val:.1f} tok/s", ha="center", va="bottom",
                 fontsize=11, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
+    try:
+        fig.tight_layout()
+    except (ValueError, Exception):
+        pass
 
     outpath = os.path.join(tempfile.mkdtemp(prefix="nanollm_ui_bench_"), "bench.png")
     fig.savefig(outpath, dpi=130)
@@ -478,6 +490,9 @@ def train_stream(max_epochs_override: int, batch_size_override: int,
             elif t == "step":
                 step_counter += 1
                 train_history.append((evt["global_step"], evt["loss"]))
+                # Update the live loss curve every 10 steps
+                if step_counter % 10 == 0 and train_history:
+                    last_plot_path = _build_live_curve(train_history, epoch_history)
                 # Emit a log line only every log_interval steps (same cadence as CLI)
                 if evt["batch_idx"] % cfg.log_interval == 0:
                     ppl = math.exp(min(evt["loss"], 20)) if evt["loss"] < 20 else float("inf")
@@ -521,9 +536,11 @@ def train_stream(max_epochs_override: int, batch_size_override: int,
                 yield (as_text(), last_plot_path, "error", samples_text)
                 return
 
-            # Throttle UI updates so we're not choking SSE with every step
+            # Throttle UI updates — flush immediately for infrequent events
+            # (log, epoch, best, done, error) but rate-limit high-frequency
+            # step events to every 0.5s so we don't choke the SSE stream.
             now = time.time()
-            if (t in ("epoch", "best", "done", "error")
+            if (t in ("log", "epoch", "best", "done", "error")
                 or now - last_emit >= 0.5):
                 yield (as_text(), last_plot_path, "running", samples_text)
                 last_emit = now
@@ -858,230 +875,13 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
-            "Four tabs: **Generate** (live streaming), **Teach** (16 explanatory slides), "
-            "**Attention** (per-head heatmaps), **Benchmark** (KV-cache speedup)."
+            "Tabs follow the build → train → explore workflow: "
+            "**Build Steps** → **Train** → **Effects** → **Teach** → "
+            "**Attention** → **Generate** → **Benchmark**."
         )
         gr.Markdown(_STATUS)
 
-        # ── Tab 1: Generate ──
-        with gr.Tab("Generate"):
-            gr.Markdown(
-                "**Tip:** Toggle the KV cache off to see the slower no-cache path "
-                "(the reference implementation used in most tutorials)."
-            )
-            with gr.Row():
-                with gr.Column(scale=2):
-                    gen_prompt = gr.Textbox(
-                        label="Prompt", value="To be or not to be, ",
-                        lines=2, max_lines=4,
-                    )
-                    with gr.Row():
-                        gen_max = gr.Slider(8, max_seq - 1, 100, step=1,
-                                            label="max_new_tokens")
-                    with gr.Row():
-                        gen_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05,
-                                             label="temperature")
-                        gen_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
-                        gen_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05,
-                                             label="top_p (nucleus)")
-                    gen_cache = gr.Checkbox(True, label="Use KV cache (generate_fast)")
-                    gen_btn = gr.Button("Generate", variant="primary")
-                with gr.Column(scale=3):
-                    gen_out = gr.Textbox(
-                        label="Output (streaming)", lines=16, show_copy_button=True,
-                    )
-            gen_btn.click(
-                generate_stream,
-                inputs=[gen_prompt, gen_max, gen_temp, gen_topk, gen_topp, gen_cache],
-                outputs=gen_out,
-            )
-
-        # ── Tab 2: Teach ──
-        with gr.Tab("Teach"):
-            gr.Markdown(
-                "Render the 16 step-by-step slides on-the-fly for any prompt. "
-                "Changing `layer` / `head` / `query_pos` re-renders slides 02–09 for "
-                "that specific slice of the model. Aligned with Raschka's "
-                "*Build a Large Language Model (From Scratch)* — see `REFERENCES.md`."
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    teach_prompt = gr.Textbox(
-                        label="Prompt", value="The cat sat on the", lines=2,
-                    )
-                    teach_layer = gr.Slider(0, n_layers - 1, 0, step=1, label="layer")
-                    teach_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
-                    teach_qpos = gr.Number(value=-1, precision=0,
-                                           label="query_pos (-1 = last token)")
-                    with gr.Row():
-                        teach_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05, label="temp")
-                        teach_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
-                        teach_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05, label="top_p")
-                    teach_btn = gr.Button("Render 16 slides", variant="primary")
-                    teach_status = gr.Markdown()
-                with gr.Column(scale=2):
-                    teach_gallery = gr.Gallery(
-                        label="Slides", columns=2, height=700,
-                        show_label=False, object_fit="contain",
-                    )
-            teach_btn.click(
-                render_teach,
-                inputs=[teach_prompt, teach_layer, teach_head, teach_qpos,
-                        teach_temp, teach_topk, teach_topp],
-                outputs=[teach_gallery, teach_status],
-            )
-
-        # ── Tab 3: Attention ──
-        with gr.Tab("Attention"):
-            gr.Markdown(
-                "Heatmap view: one head's attention matrix + the attention rollout "
-                "across all layers (Abnar & Zuidema 2020). "
-                "Rows = query position, columns = key position. "
-                "Bright cells = strong attention."
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    attn_prompt = gr.Textbox(
-                        label="Prompt", value="To be or not to be", lines=2,
-                    )
-                    attn_layer = gr.Slider(0, n_layers - 1, n_layers // 2,
-                                           step=1, label="layer")
-                    attn_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
-                    attn_btn = gr.Button("Render attention", variant="primary")
-                    attn_status = gr.Markdown()
-                with gr.Column(scale=2):
-                    with gr.Row():
-                        attn_head_img = gr.Image(label="Single head", type="filepath")
-                        attn_rollout_img = gr.Image(label="Rollout (all layers)", type="filepath")
-            attn_btn.click(
-                render_attention,
-                inputs=[attn_prompt, attn_layer, attn_head],
-                outputs=[attn_head_img, attn_rollout_img, attn_status],
-            )
-
-        # ── Tab 4: Benchmark ──
-        with gr.Tab("Benchmark"):
-            gr.Markdown(
-                "Compare `generate()` (no cache, O(T²) per step) vs "
-                "`generate_fast()` (KV cache, O(T) per step). "
-                "Speedup grows with sequence length."
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    bench_prompt = gr.Textbox(
-                        label="Prompt", value="The ", lines=1,
-                    )
-                    bench_n = gr.Slider(20, max_seq - 10, 100, step=10,
-                                        label="tokens to generate")
-                    bench_btn = gr.Button("Run benchmark", variant="primary")
-                    bench_summary = gr.Code(
-                        label="Result", language=None, interactive=False,
-                    )
-                with gr.Column(scale=2):
-                    bench_img = gr.Image(label="Throughput", type="filepath")
-            bench_btn.click(
-                run_bench,
-                inputs=[bench_prompt, bench_n],
-                outputs=[bench_img, bench_summary],
-            )
-
-        # ── Tab 5: Train ──
-        with gr.Tab("Train"):
-            gr.Markdown(
-                "**Trigger training from the UI and watch progress live.** "
-                "Training writes `checkpoints/best.pt` and `checkpoints/loss_curve.png`. "
-                "When it finishes, the Generate / Teach / Attention tabs pick up the "
-                "new model automatically — no restart. "
-                "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
-            )
-            with gr.Row():
-                with gr.Column(scale=1, min_width=280):
-                    train_epochs = gr.Slider(
-                        1, 30, value=10, step=1, label="max_epochs",
-                        info="Short (3-5) for demos, longer (10-20) for real runs.",
-                    )
-                    train_batch = gr.Slider(
-                        8, 128, value=64, step=8, label="batch_size",
-                        info="Lower this if you hit OOM (8-16 for small GPUs).",
-                    )
-                    train_lr = gr.Slider(
-                        1e-5, 1e-3, value=3e-4, step=1e-5, label="learning_rate",
-                        info="Peak LR after warmup. 3e-4 is the AdamW standard.",
-                    )
-                    train_dropout = gr.Slider(
-                        0.0, 0.4, value=0.1, step=0.05, label="dropout",
-                        info="Increase (0.2-0.3) to fight overfitting.",
-                    )
-                    train_warmup = gr.Slider(
-                        0, 500, value=0, step=10, label="warmup_steps",
-                        info="0 = auto-scale (10% of total steps, recommended).",
-                    )
-                    train_btn = gr.Button("Start training", variant="primary", size="lg")
-                    train_status = gr.Textbox(
-                        label="Status", value="idle", interactive=False,
-                    )
-                    train_samples = gr.Textbox(
-                        label="Latest generation sample",
-                        lines=4, interactive=False,
-                    )
-                with gr.Column(scale=2):
-                    train_log = gr.Textbox(
-                        label="Training log (streaming)",
-                        value="(press Start to begin)",
-                        lines=22, max_lines=30, show_copy_button=True,
-                        interactive=False,
-                    )
-                    train_plot = gr.Image(
-                        label="Loss curve (live)", type="filepath", height=340,
-                    )
-
-            train_btn.click(
-                train_stream,
-                inputs=[train_epochs, train_batch, train_lr,
-                        train_dropout, train_warmup],
-                outputs=[train_log, train_plot, train_status, train_samples],
-            )
-
-        # ── Tab 6: Effects ──
-        with gr.Tab("Effects"):
-            gr.Markdown(
-                "**How does each training hyperparameter shape the loss curve?** "
-                "The plots below are schematic (synthetic data, based on the "
-                "standard behavior observed in the ML literature and on small "
-                "transformers). Use them as a reference when choosing settings "
-                "in the **Train** tab."
-            )
-            with gr.Row():
-                with gr.Column(scale=1, min_width=220):
-                    effect_radio = gr.Radio(
-                        choices=effect_viz.PARAMS,
-                        value=effect_viz.PARAMS[0],
-                        label="Parameter",
-                        interactive=True,
-                    )
-                    effect_caption = gr.Markdown()
-                with gr.Column(scale=2):
-                    effect_img = gr.Image(
-                        label="How it shapes training", type="filepath",
-                        show_label=False, height=540,
-                    )
-
-            def on_effect_change(param):
-                caption, img = render_effect_panel(param)
-                return caption, img
-
-            effect_radio.change(
-                on_effect_change, inputs=effect_radio,
-                outputs=[effect_caption, effect_img],
-            )
-            # Eager-render the first plot so the panel isn't blank on load
-            demo.load(
-                lambda: render_effect_panel(effect_viz.PARAMS[0]),
-                inputs=None,
-                outputs=[effect_caption, effect_img],
-            )
-
-        # ── Tab 7: Build Steps ──
+        # ── Tab 1: Build Steps (orientation — how the project is structured) ──
         with gr.Tab("Build Steps"):
             gr.Markdown(
                 "A 12-step tour of how this project was actually built, in the order "
@@ -1141,6 +941,224 @@ def build_ui() -> gr.Blocks:
                 lambda: render_step_panel(0),
                 inputs=None,
                 outputs=[build_md, build_img],
+            )
+
+        # ── Tab 2: Train (train the model) ──
+        with gr.Tab("Train"):
+            gr.Markdown(
+                "**Trigger training from the UI and watch progress live.** "
+                "Training writes `checkpoints/best.pt` and `checkpoints/loss_curve.png`. "
+                "When it finishes, the Generate / Teach / Attention tabs pick up the "
+                "new model automatically — no restart. "
+                "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=280):
+                    train_epochs = gr.Slider(
+                        1, 30, value=10, step=1, label="max_epochs",
+                        info="Short (3-5) for demos, longer (10-20) for real runs.",
+                    )
+                    train_batch = gr.Slider(
+                        8, 128, value=64, step=8, label="batch_size",
+                        info="Lower this if you hit OOM (8-16 for small GPUs).",
+                    )
+                    train_lr = gr.Slider(
+                        1e-5, 1e-3, value=3e-4, step=1e-5, label="learning_rate",
+                        info="Peak LR after warmup. 3e-4 is the AdamW standard.",
+                    )
+                    train_dropout = gr.Slider(
+                        0.0, 0.4, value=0.1, step=0.05, label="dropout",
+                        info="Increase (0.2-0.3) to fight overfitting.",
+                    )
+                    train_warmup = gr.Slider(
+                        0, 500, value=0, step=10, label="warmup_steps",
+                        info="0 = auto-scale (10% of total steps, recommended).",
+                    )
+                    train_btn = gr.Button("Start training", variant="primary", size="lg")
+                    train_status = gr.Textbox(
+                        label="Status", value="idle", interactive=False,
+                    )
+                    train_samples = gr.Textbox(
+                        label="Latest generation sample",
+                        lines=4, interactive=False,
+                    )
+                with gr.Column(scale=2):
+                    train_log = gr.Textbox(
+                        label="Training log (streaming)",
+                        value="(press Start to begin)",
+                        lines=22, max_lines=30, show_copy_button=True,
+                        interactive=False,
+                    )
+                    train_plot = gr.Image(
+                        label="Loss curve (live)", type="filepath", height=340,
+                    )
+
+            train_btn.click(
+                train_stream,
+                inputs=[train_epochs, train_batch, train_lr,
+                        train_dropout, train_warmup],
+                outputs=[train_log, train_plot, train_status, train_samples],
+            )
+
+        # ── Tab 3: Effects (hyperparameter reference) ──
+        with gr.Tab("Effects"):
+            gr.Markdown(
+                "**How does each training hyperparameter shape the loss curve?** "
+                "The plots below are schematic (synthetic data, based on the "
+                "standard behavior observed in the ML literature and on small "
+                "transformers). Use them as a reference when choosing settings "
+                "in the **Train** tab."
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=220):
+                    effect_radio = gr.Radio(
+                        choices=effect_viz.PARAMS,
+                        value=effect_viz.PARAMS[0],
+                        label="Parameter",
+                        interactive=True,
+                    )
+                    effect_caption = gr.Markdown()
+                with gr.Column(scale=2):
+                    effect_img = gr.Image(
+                        label="How it shapes training", type="filepath",
+                        show_label=False, height=540,
+                    )
+
+            def on_effect_change(param):
+                caption, img = render_effect_panel(param)
+                return caption, img
+
+            effect_radio.change(
+                on_effect_change, inputs=effect_radio,
+                outputs=[effect_caption, effect_img],
+            )
+            # Eager-render the first plot so the panel isn't blank on load
+            demo.load(
+                lambda: render_effect_panel(effect_viz.PARAMS[0]),
+                inputs=None,
+                outputs=[effect_caption, effect_img],
+            )
+
+        # ── Tab 4: Teach (step-by-step forward pass) ──
+        with gr.Tab("Teach"):
+            gr.Markdown(
+                "Render the 16 step-by-step slides on-the-fly for any prompt. "
+                "Changing `layer` / `head` / `query_pos` re-renders slides 02–09 for "
+                "that specific slice of the model. Aligned with Raschka's "
+                "*Build a Large Language Model (From Scratch)* — see `REFERENCES.md`."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    teach_prompt = gr.Textbox(
+                        label="Prompt", value="The cat sat on the", lines=2,
+                    )
+                    teach_layer = gr.Slider(0, n_layers - 1, 0, step=1, label="layer")
+                    teach_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
+                    teach_qpos = gr.Number(value=-1, precision=0,
+                                           label="query_pos (-1 = last token)")
+                    with gr.Row():
+                        teach_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05, label="temp")
+                        teach_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
+                        teach_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05, label="top_p")
+                    teach_btn = gr.Button("Render 16 slides", variant="primary")
+                    teach_status = gr.Markdown()
+                with gr.Column(scale=2):
+                    teach_gallery = gr.Gallery(
+                        label="Slides", columns=2, height=700,
+                        show_label=False, object_fit="contain",
+                    )
+            teach_btn.click(
+                render_teach,
+                inputs=[teach_prompt, teach_layer, teach_head, teach_qpos,
+                        teach_temp, teach_topk, teach_topp],
+                outputs=[teach_gallery, teach_status],
+            )
+
+        # ── Tab 5: Attention (per-head heatmaps) ──
+        with gr.Tab("Attention"):
+            gr.Markdown(
+                "Heatmap view: one head's attention matrix + the attention rollout "
+                "across all layers (Abnar & Zuidema 2020). "
+                "Rows = query position, columns = key position. "
+                "Bright cells = strong attention."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    attn_prompt = gr.Textbox(
+                        label="Prompt", value="To be or not to be", lines=2,
+                    )
+                    attn_layer = gr.Slider(0, n_layers - 1, n_layers // 2,
+                                           step=1, label="layer")
+                    attn_head = gr.Slider(0, n_heads - 1, 0, step=1, label="head")
+                    attn_btn = gr.Button("Render attention", variant="primary")
+                    attn_status = gr.Markdown()
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        attn_head_img = gr.Image(label="Single head", type="filepath")
+                        attn_rollout_img = gr.Image(label="Rollout (all layers)", type="filepath")
+            attn_btn.click(
+                render_attention,
+                inputs=[attn_prompt, attn_layer, attn_head],
+                outputs=[attn_head_img, attn_rollout_img, attn_status],
+            )
+
+        # ── Tab 6: Generate (interactive text generation) ──
+        with gr.Tab("Generate"):
+            gr.Markdown(
+                "**Tip:** Toggle the KV cache off to see the slower no-cache path "
+                "(the reference implementation used in most tutorials)."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gen_prompt = gr.Textbox(
+                        label="Prompt", value="To be or not to be, ",
+                        lines=2, max_lines=4,
+                    )
+                    with gr.Row():
+                        gen_max = gr.Slider(8, max_seq - 1, 100, step=1,
+                                            label="max_new_tokens")
+                    with gr.Row():
+                        gen_temp = gr.Slider(0.05, 2.0, 0.8, step=0.05,
+                                             label="temperature")
+                        gen_topk = gr.Slider(0, 200, 40, step=1, label="top_k")
+                        gen_topp = gr.Slider(0.05, 1.0, 0.9, step=0.05,
+                                             label="top_p (nucleus)")
+                    gen_cache = gr.Checkbox(True, label="Use KV cache (generate_fast)")
+                    gen_btn = gr.Button("Generate", variant="primary")
+                with gr.Column(scale=3):
+                    gen_out = gr.Textbox(
+                        label="Output (streaming)", lines=16, show_copy_button=True,
+                    )
+            gen_btn.click(
+                generate_stream,
+                inputs=[gen_prompt, gen_max, gen_temp, gen_topk, gen_topp, gen_cache],
+                outputs=gen_out,
+            )
+
+        # ── Tab 7: Benchmark (cache vs no-cache comparison) ──
+        with gr.Tab("Benchmark"):
+            gr.Markdown(
+                "Compare `generate()` (no cache, O(T²) per step) vs "
+                "`generate_fast()` (KV cache, O(T) per step). "
+                "Speedup grows with sequence length."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    bench_prompt = gr.Textbox(
+                        label="Prompt", value="The ", lines=1,
+                    )
+                    bench_n = gr.Slider(20, max_seq - 10, 100, step=10,
+                                        label="tokens to generate")
+                    bench_btn = gr.Button("Run benchmark", variant="primary")
+                    bench_summary = gr.Code(
+                        label="Result", language=None, interactive=False,
+                    )
+                with gr.Column(scale=2):
+                    bench_img = gr.Image(label="Throughput", type="filepath")
+            bench_btn.click(
+                run_bench,
+                inputs=[bench_prompt, bench_n],
+                outputs=[bench_img, bench_summary],
             )
 
         gr.Markdown(

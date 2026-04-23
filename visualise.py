@@ -116,7 +116,6 @@ def plot_attention_heatmap(weights, token_labels, title, save_path):
     ax.set_title(title, fontsize=13, fontweight="bold")
 
     plt.colorbar(im, ax=ax, shrink=0.8)
-    plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {save_path}")
@@ -139,7 +138,10 @@ def visualise(
     config.vocab_size = tokenizer.vocab_size
 
     model = NanoLLM(config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in sd):
+        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     model.eval()
 
     # Tokenise input
