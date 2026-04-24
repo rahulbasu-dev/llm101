@@ -32,6 +32,7 @@ files.zip
 *.bin
 *.ckpt
 *.pptx
+gen_pptx.py
 
 # Logs
 *.log
