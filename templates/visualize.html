@@ -299,6 +299,38 @@
   font-family: monospace;
   flex-shrink: 0;
 }
+
+/* ── Narration bar ── */
+.nanollm-viz .nv-narration {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 10px 14px; margin-bottom: 8px;
+  background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.3);
+  border-radius: var(--radius); font-size: 13px; line-height: 1.5;
+  color: #cbd5e1; min-height: 42px;
+}
+.nanollm-viz .nv-narration-icon { font-size: 16px; flex-shrink: 0; }
+
+/* ── Colormap legend ── */
+.nanollm-viz .nv-legend {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 6px 14px; margin-bottom: 8px;
+  font-size: 11px; color: var(--text-dim);
+}
+.nanollm-viz .nv-legend-bar {
+  width: 80px; height: 12px; border-radius: 3px;
+  background: linear-gradient(90deg, #ffffff 0%, #6366f1 50%, #1e1b4b 100%);
+}
+.nanollm-viz .nv-legend-swatch {
+  display: inline-block; width: 12px; height: 12px; border-radius: 2px;
+  vertical-align: middle; margin-left: 6px;
+}
+.nanollm-viz .nv-legend-sep { color: #475569; margin: 0 4px; }
+.nanollm-viz .nv-legend-label { font-weight: 600; color: #94a3b8; }
+
+/* ── Active row highlight on grid ── */
+.nanollm-viz .nv-cell.active-row {
+  box-shadow: inset 0 0 0 2px var(--accent-amber);
+}
 </style>
 
 <!-- ================================================================
@@ -317,6 +349,25 @@
     <label><input type="checkbox" class="nv-loop"> Loop</label>
     <button class="nv-secondary nv-btn-reset">Reset</button>
     <span class="nv-progress">Loading...</span>
+  </div>
+
+  <!-- Narration Bar — explains what's happening at each step -->
+  <div class="nv-narration">
+    <span class="nv-narration-icon">💡</span>
+    <span class="nv-narration-text">Click <b>▶ Play</b> to watch data flow through the transformer layer by layer, or use <b>◀ ▶</b> to step manually.</span>
+  </div>
+
+  <!-- Colormap Legend -->
+  <div class="nv-legend">
+    <span class="nv-legend-label">Attention weight:</span>
+    <span class="nv-legend-low">0 (ignores)</span>
+    <div class="nv-legend-bar"></div>
+    <span class="nv-legend-high">1 (strong focus)</span>
+    <span class="nv-legend-sep">|</span>
+    <span class="nv-legend-label">Norm color:</span>
+    <span class="nv-legend-swatch" style="background:#22c55e"></span> normal
+    <span class="nv-legend-swatch" style="background:#f59e0b"></span> growing
+    <span class="nv-legend-swatch" style="background:#ef4444"></span> large
   </div>
 
   <!-- Three-Panel Layout -->
@@ -381,6 +432,7 @@
   var attnGrid     = q(".nv-grid");
   var colHeaders   = q(".nv-col-headers");
   var actPanel     = q(".nv-act");
+  var narrationTxt = q(".nv-narration-text");
   var detailPanel  = q(".nv-detail");
   var detailCanvas = q(".nv-detail-canvas");
   var detailInfo   = q(".nv-detail-info");
@@ -590,6 +642,7 @@
     updateGrid();
     updateAct();
     updateProgress();
+    updateNarration();
     updateDetail();
   }
 
@@ -633,6 +686,9 @@
     for (var l = 0; l < nLayers; l++) {
       for (var h = 0; h < nHeads; h++) {
         var e = cellCanvases[l][h];
+        // Active row highlight
+        e.cell.classList.remove("active-row");
+        if (l === currentLayer) e.cell.classList.add("active-row");
         if (l <= currentLayer) {
           e.cell.classList.remove("unfilled");
           e.cell.classList.add("filled");
@@ -681,6 +737,33 @@
       progressTxt.textContent = "Layer " + (currentLayer + 1) + "/" +
         nLayers + " \u2014 Block " + currentLayer;
     }
+  }
+
+  // ── Narration — explain what's happening at each step ──
+  function updateNarration() {
+    var txt;
+    if (currentLayer < 0) {
+      txt = 'Click <b>▶ Play</b> to watch data flow through the transformer layer by layer, or use <b>◀ ▶</b> to step manually. '
+          + 'The input "' + tokens.join(' ') + '" (' + T + ' tokens) will pass through '
+          + nLayers + ' transformer blocks, each with ' + nHeads + ' attention heads.';
+    } else if (currentLayer === 0) {
+      txt = '<b>Layer 0 (first):</b> The token embeddings enter the first transformer block. '
+          + 'Attention patterns here are mostly <em>local</em> — each token attends strongly to itself and nearby positions. '
+          + 'The diagonal band in each heatmap shows this self-attention pattern. '
+          + 'Each of the ' + nHeads + ' heads learns to focus on different relationships.';
+    } else if (currentLayer < nLayers - 1) {
+      var mid = currentLayer < nLayers / 2 ? 'early-to-middle' : 'middle-to-deep';
+      txt = '<b>Layer ' + currentLayer + ' (' + mid + '):</b> '
+          + 'Attention patterns become more <em>distributed</em> as the model builds richer representations. '
+          + 'Some heads may specialize — one might track the previous token, another might attend to related words. '
+          + 'The activation norm (right panel) shows how the hidden state magnitude grows through the residual stream.';
+    } else {
+      txt = '<b>Layer ' + currentLayer + ' (final):</b> '
+          + 'The deepest layer produces the most <em>abstract</em> attention patterns. '
+          + 'These representations feed into the LM Head, which projects to vocabulary logits and predicts the next token. '
+          + 'Click any cell in the grid to see the full-size heatmap with token labels and tensor shapes.';
+    }
+    narrationTxt.innerHTML = txt;
   }
 
   // ── Close detail if its layer scrolled out ──
