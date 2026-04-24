@@ -254,8 +254,58 @@ for title, body, img_key in STEPS:
         add_text(slide, Inches(0.5), Inches(1.3), Inches(12), Inches(5.5),
                  body, font_size=15, color=BODY_CLR)
 
-# Save
+# ── Hyperparameter Effects section ──────────────────────────────
+import effect_viz
+
+effect_img_dir = tempfile.mkdtemp(prefix="llm101_effects_")
+effect_paths = effect_viz.render_all(effect_img_dir)
+
+# Section divider slide
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+set_bg(slide)
+add_text(slide, Inches(1), Inches(2.5), Inches(11), Inches(1.5),
+         "Hyperparameter Effects",
+         font_size=36, color=TITLE_CLR, bold=True, align=PP_ALIGN.CENTER)
+add_text(slide, Inches(1), Inches(4), Inches(11), Inches(1),
+         "How each training hyperparameter shapes the loss curve \u2014 "
+         "schematic charts based on standard ML literature and observed "
+         "behavior on small transformers",
+         font_size=16, color=BODY_CLR, align=PP_ALIGN.CENTER)
+
+# One slide per hyperparameter
+for param in effect_viz.PARAMS:
+    _, caption_md = effect_viz._PLOTS[param]
+    img_path = effect_paths.get(param)
+
+    # Strip markdown bold markers for plain text
+    caption = caption_md.replace("**", "")
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    set_bg(slide)
+
+    # Title
+    add_text(slide, Inches(0.5), Inches(0.3), Inches(12), Inches(0.7),
+             f"Effect of {param}", font_size=24, color=TITLE_CLR, bold=True)
+
+    # Accent line
+    shape = slide.shapes.add_shape(1, Inches(0.5), Inches(1.05), Inches(12.3), Pt(2))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = ACCENT
+    shape.line.fill.background()
+
+    if img_path and os.path.exists(img_path):
+        # Two-column: description left, chart right
+        add_text(slide, Inches(0.5), Inches(1.3), Inches(5.5), Inches(5.5),
+                 caption, font_size=13, color=BODY_CLR)
+        slide.shapes.add_picture(img_path,
+                                 Inches(6.3), Inches(1.3), width=Inches(6.5))
+    else:
+        add_text(slide, Inches(0.5), Inches(1.3), Inches(12), Inches(5.5),
+                 caption, font_size=15, color=BODY_CLR)
+
+# ── Save ──
 out_path = os.path.join(os.path.dirname(__file__), "LLM101_Build_Steps.pptx")
 prs.save(out_path)
+n_effect = len(effect_viz.PARAMS)
 print(f"Saved: {out_path}")
-print(f"Slides: {len(prs.slides)} (1 title + 12 steps)")
+print(f"Slides: {len(prs.slides)} (1 title + 12 steps + 1 section + {n_effect} effects)")
