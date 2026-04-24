@@ -964,21 +964,27 @@ def build_ui() -> gr.Blocks:
                         return i
                 return 0
 
+            def _img_or_hidden(img):
+                """Return the image or hide the component if None."""
+                if img is None:
+                    return gr.update(value=None, visible=False)
+                return gr.update(value=img, visible=True)
+
             def on_select(choice):
                 md, img = render_step_panel(_idx_from_choice(choice))
-                return md, img
+                return md, _img_or_hidden(img)
 
             def on_prev(choice):
                 i = max(0, _idx_from_choice(choice) - 1)
                 new_choice = _BUILD_STEPS[i][0].split("·")[0].strip()
                 md, img = render_step_panel(i)
-                return new_choice, md, img
+                return new_choice, md, _img_or_hidden(img)
 
             def on_next(choice):
                 i = min(len(_BUILD_STEPS) - 1, _idx_from_choice(choice) + 1)
                 new_choice = _BUILD_STEPS[i][0].split("·")[0].strip()
                 md, img = render_step_panel(i)
-                return new_choice, md, img
+                return new_choice, md, _img_or_hidden(img)
 
             build_radio.change(on_select, inputs=build_radio,
                                outputs=[build_md, build_img])
@@ -990,7 +996,7 @@ def build_ui() -> gr.Blocks:
             # Eager-render the first step's image on load so the initial view
             # isn't empty
             demo.load(
-                lambda: render_step_panel(0),
+                lambda: on_select(_BUILD_STEPS[0][0].split("·")[0].strip()),
                 inputs=None,
                 outputs=[build_md, build_img],
             )
