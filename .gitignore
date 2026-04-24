@@ -34,5 +34,6 @@ files.zip
 # Logs
 *.log
 
-# Lecture notes (not for public repo)
-LLM101_Lecture_Notes.md
+# Markdown files (except README.md)
+*.md
+!README.md
