@@ -334,7 +334,7 @@ _PLOTS = {
                       "signal — the wider the gap, the more your model is "
                       "memorizing rather than generalizing. \"Best val\" gives you "
                       "the ideal number of epochs for this data.\n\n"
-                      "**Rules of thumb:** on TinyShakespeare, expect sweet-spot "
+                      "**Rules of thumb:** on TinyStories, expect sweet-spot "
                       "around epoch 8-12; by epoch 20+ overfitting dominates."),
     "batch_size":    (plot_batch_size_effect,
                       "**Larger batch = smoother gradient + fewer updates per "

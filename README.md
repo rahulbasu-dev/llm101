@@ -11,7 +11,7 @@ Aligned with Sebastian Raschka's
 ## Quick Start
 
 ```bash
-bash run.sh setup      # venv + PyTorch + TinyShakespeare corpus
+bash run.sh setup      # venv + PyTorch + TinyStories corpus
 bash run.sh verify     # shape test + KV-cache equivalence check
 bash run.sh train      # train (~5 min GPU, ~30 min CPU)
 bash run.sh generate --fast   # interactive generation with KV cache
@@ -122,7 +122,7 @@ Equivalence verified by `test_kv_cache_matches_full_pass` (max |Δlogit| < 1e-4)
 | n_heads | 6 | Attention heads (d_head=64) |
 | d_ff | 1536 | FFN intermediate (4× d_model) |
 | max_seq_len | 256 | Context window |
-| vocab_size | ~4096 | BPE on TinyShakespeare |
+| vocab_size | ~4096 | BPE on TinyStories |
 | batch_size | 64 | Adjustable via CLI/UI |
 | learning_rate | 3e-4 | AdamW with cosine decay |
 

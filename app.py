@@ -886,7 +886,7 @@ _BUILD_STEPS: list[tuple[str, str, str | None]] = [
         "12 · Ship it  ·  `run.sh`",
         "Commands unified through one bash dispatcher:\n\n"
         "```bash\n"
-        "bash run.sh setup       # venv + torch + TinyShakespeare\n"
+        "bash run.sh setup       # venv + torch + TinyStories\n"
         "bash run.sh verify      # model.py __main__ sanity check\n"
         "bash run.sh train       # full training (~5-15 min on RTX 4080)\n"
         "bash run.sh generate --fast\n"
@@ -1391,7 +1391,7 @@ def build_ui() -> gr.Blocks:
                     gen_prompt = gr.Textbox(
                         label="Prompt", value="To be or not to be, ",
                         lines=2, max_lines=4,
-                        info="Starting text the model continues from. The model has only seen Shakespeare during training.",
+                        info="Starting text the model continues from. The model has only seen simple short stories during training.",
                     )
                     with gr.Row():
                         gen_max = gr.Slider(

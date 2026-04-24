@@ -154,7 +154,7 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
     if not os.path.exists(config.data_path):
         yield {"type": "error",
                "msg": f"Training data not found at {config.data_path}. "
-                      f"Run: bash run.sh setup  (downloads TinyShakespeare)"}
+                      f"Run: bash run.sh setup  (downloads TinyStories)"}
         return
 
     yield {"type": "log", "msg": f"Reading corpus from {config.data_path}..."}

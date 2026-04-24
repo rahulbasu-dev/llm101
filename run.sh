@@ -197,17 +197,22 @@ else:
     echo -e "${GREEN}[4/4] Downloading training data...${NC}"
     mkdir -p data
     if [ ! -f "data/corpus.txt" ]; then
-        echo "  Downloading TinyShakespeare (~1.1MB)..."
+        echo "  Downloading TinyStories (Microsoft Research, ~1.5MB subset)..."
+        STORIES_URL="https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt"
+        STORIES_RAW="data/raw_stories.txt"
         if command -v wget &> /dev/null; then
-            wget -q "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt" -O data/corpus.txt
+            wget -q "$STORIES_URL" -O "$STORIES_RAW"
         elif command -v curl &> /dev/null; then
-            curl -sL "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt" -o data/corpus.txt
+            curl -sL "$STORIES_URL" -o "$STORIES_RAW"
         else
             echo "  ERROR: Neither wget nor curl found. Please download manually:"
-            echo "  URL: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+            echo "  URL: $STORIES_URL"
             echo "  Save to: data/corpus.txt"
             exit 1
         fi
+        # Truncate to ~1.5MB for fast training (full file is ~27MB)
+        head -c 1500000 "$STORIES_RAW" > data/corpus.txt
+        rm -f "$STORIES_RAW"
         echo "  ✓ data/corpus.txt ($(wc -c < data/corpus.txt) bytes)"
     else
         echo "  ✓ data/corpus.txt already exists ($(wc -c < data/corpus.txt) bytes)"
@@ -367,7 +372,7 @@ if os.path.exists(corpus_path):
     corpus_chars = os.path.getsize(corpus_path)
     est_tokens = int(corpus_chars / 4.0)  # rough char-to-token ratio
 else:
-    est_tokens = 280_000  # TinyShakespeare default
+    est_tokens = 400_000  # TinyStories 1.5MB subset default
 
 train_tokens = int(est_tokens * 0.9)
 stride = config.max_seq_len // 2

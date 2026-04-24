@@ -1,7 +1,7 @@
 """Shared fixtures for NanoLLM tests.
 
 Design goals:
-  - Zero external data (no TinyShakespeare download required).
+  - Zero external data (no TinyStories download required).
   - CPU-only (tests run anywhere).
   - Tiny everything: d_model=32, n_layers=2, seq_len=16, vocab~300.
     Full test suite completes in seconds.
