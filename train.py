@@ -103,7 +103,8 @@ def save_loss_curve(train_history, epoch_history, path):
         ax.set_title("LLM101 training curve", fontsize=13, fontweight="bold")
         ax.legend(loc="upper right", framealpha=0.9)
         ax.grid(True, which="both", alpha=0.3)
-        plt.savefig(path, dpi=150, bbox_inches="tight")
+        from config import safe_savefig
+        safe_savefig(path, dpi=150)
         plt.close()
         return True
     except Exception:

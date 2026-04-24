@@ -79,7 +79,8 @@ def plot_epochs_effect(path: str) -> str:
     ax.grid(True, alpha=0.3)
     ax.set_xlim(1, 30)
 
-    plt.savefig(path, dpi=140, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(path)
     plt.close()
     return path
 
@@ -128,7 +129,8 @@ def plot_batch_size_effect(path: str) -> str:
 
     fig.suptitle("Effect of batch_size on training",
                  fontsize=13, fontweight="bold", y=1.02)
-    plt.savefig(path, dpi=140, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(path)
     plt.close()
     return path
 
@@ -173,7 +175,8 @@ def plot_learning_rate_effect(path: str) -> str:
     ax.set_ylim(1.5, 12)
     ax.set_xlim(0, 500)
 
-    plt.savefig(path, dpi=140, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(path)
     plt.close()
     return path
 
@@ -225,7 +228,8 @@ def plot_dropout_effect(path: str) -> str:
     ax.grid(True, alpha=0.3)
     ax.set_xlim(-0.02, 0.62)
 
-    plt.savefig(path, dpi=140, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(path)
     plt.close()
     return path
 
@@ -313,7 +317,8 @@ def plot_warmup_effect(path: str) -> str:
 
     fig.suptitle("Effect of warmup_steps on the LR schedule and final loss",
                  fontsize=13, fontweight="bold", y=1.02)
-    plt.savefig(path, dpi=140, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(path)
     plt.close()
     return path
 

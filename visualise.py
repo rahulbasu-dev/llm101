@@ -116,7 +116,8 @@ def plot_attention_heatmap(weights, token_labels, title, save_path):
     ax.set_title(title, fontsize=13, fontweight="bold")
 
     plt.colorbar(im, ax=ax, shrink=0.8)
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    from config import safe_savefig
+    safe_savefig(save_path, dpi=150)
     plt.close()
     print(f"  Saved: {save_path}")
 
