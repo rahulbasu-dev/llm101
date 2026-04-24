@@ -1009,13 +1009,13 @@ def build_ui() -> gr.Blocks:
             "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
             "Tabs follow the build → train → explore workflow: "
-            "**Build Steps** → **Train** → **Effects** → **Train Reports** → "
+            "**Train** → **Effects** → **Train Reports** → "
             "**Attention** → **Visualize** → **Generate** → **Benchmark**."
         )
         gr.Markdown(_STATUS)
 
         # ── Tab 1: Build Steps (orientation — how the project is structured) ──
-        with gr.Tab("Build Steps"):
+        with gr.Tab("Build Steps", visible=False):
             gr.Markdown(
                 "A 12-step tour of how this project was actually built, in the order "
                 "a new builder should follow. Complements the standalone `BUILDING.md` "
