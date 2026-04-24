@@ -25,6 +25,7 @@ teaching_plots_smoke/
 Thumbs.db
 
 # Project-specific
+docs/
 reference/
 files.zip
 *.pt
