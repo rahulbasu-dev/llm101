@@ -1009,8 +1009,8 @@ def build_ui() -> gr.Blocks:
             "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
             "Tabs follow the build → train → explore workflow: "
-            "**Train** → **Effects** → **Train Reports** → "
-            "**Attention** → **Visualize** → **Generate** → **Benchmark**."
+            "**Train** → **Train Reports** → **Attention** → "
+            "**Visualize** → **Generate** → **Benchmark**."
         )
         gr.Markdown(_STATUS)
 
@@ -1140,7 +1140,7 @@ def build_ui() -> gr.Blocks:
             )
 
         # ── Tab 3: Effects (hyperparameter reference) ──
-        with gr.Tab("Effects"):
+        with gr.Tab("Effects", visible=False):
             gr.Markdown(
                 "**How does each training hyperparameter shape the loss curve?** "
                 "The plots below are schematic (synthetic data, based on the "
