@@ -278,7 +278,88 @@ def render_teach(prompt, layer, head, query_pos, temperature, top_k, top_p):
         f"({len(token_ids)} tokens) · layer={layer} · head={head} · "
         f"query_pos={query_pos} ('{labels[query_pos]}')"
     )
-    return gallery, status
+    return gallery, status, outdir
+
+
+def export_slides_pptx(slide_dir: str, params_label: str) -> str | None:
+    """Export rendered slide PNGs from a directory to a PPTX file."""
+    try:
+        from pptx import Presentation as Pptx
+        from pptx.util import Inches as In, Pt as PtU
+        from pptx.dml.color import RGBColor as RGB
+        from pptx.enum.text import PP_ALIGN
+    except ImportError:
+        return None
+
+    if not slide_dir or not os.path.isdir(slide_dir):
+        return None
+
+    prs = Pptx()
+    prs.slide_width = In(13.333)
+    prs.slide_height = In(7.5)
+
+    BG = RGB(0x0F, 0x17, 0x2A)
+    TITLE_CLR = RGB(0x93, 0xC5, 0xFD)
+    DIM_CLR = RGB(0x94, 0xA3, 0xB8)
+
+    # Title slide
+    sl = prs.slides.add_slide(prs.slide_layouts[6])
+    sl.background.fill.solid()
+    sl.background.fill.fore_color.rgb = BG
+    tb = sl.shapes.add_textbox(In(0.5), In(2.5), In(12), In(1))
+    p = tb.text_frame.paragraphs[0]
+    p.text = "Train Reports — 16-slide forward-pass walkthrough"
+    p.font.size = PtU(28)
+    p.font.color.rgb = TITLE_CLR
+    p.font.bold = True
+    p.alignment = PP_ALIGN.CENTER
+    tb2 = sl.shapes.add_textbox(In(0.5), In(3.8), In(12), In(0.6))
+    p2 = tb2.text_frame.paragraphs[0]
+    p2.text = params_label
+    p2.font.size = PtU(16)
+    p2.font.color.rgb = DIM_CLR
+    p2.alignment = PP_ALIGN.CENTER
+
+    # Slide captions
+    captions = [
+        "01 · Tokenization", "02 · Embeddings", "03 · Q, K, V projections",
+        "04 · Attention scores (raw)", "05 · Causal mask applied",
+        "06 · Softmax attention weights", "07 · Weighted value sum",
+        "08 · All heads side-by-side", "09 · FFN before/delta/after",
+        "10 · Next-token distribution", "11 · Sampling rollout",
+        "12 · RoPE positional encoding", "13 · Scaling rationale",
+        "14 · Temperature effect", "15 · Greedy vs sampling",
+        "16 · Parameter breakdown",
+    ]
+
+    pngs = sorted(f for f in os.listdir(slide_dir) if f.endswith(".png"))
+    for i, png in enumerate(pngs):
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        sl.background.fill.solid()
+        sl.background.fill.fore_color.rgb = BG
+        # Caption
+        cap = captions[i] if i < len(captions) else png
+        tb = sl.shapes.add_textbox(In(0.3), In(0.2), In(12.5), In(0.5))
+        p = tb.text_frame.paragraphs[0]
+        p.text = cap
+        p.font.size = PtU(20)
+        p.font.color.rgb = TITLE_CLR
+        p.font.bold = True
+        # Image centered
+        sl.shapes.add_picture(
+            os.path.join(slide_dir, png),
+            In(0.5), In(0.9), width=In(12.3),
+        )
+
+    out_path = os.path.join(slide_dir, "Train_Reports.pptx")
+    prs.save(out_path)
+    return out_path
+
+
+# State for pin-and-compare
+_PINNED_GALLERY = []
+_PINNED_LABEL = ""
+_LAST_SLIDE_DIR = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1146,17 +1227,67 @@ def build_ui() -> gr.Blocks:
                             info="Nucleus sampling: keep tokens until cumulative probability reaches top_p.",
                         )
                     teach_btn = gr.Button("Render 16 slides", variant="primary")
+                    with gr.Row():
+                        teach_pin_btn = gr.Button("Pin for comparison", size="sm")
+                        teach_dl_btn = gr.Button("Download PPTX", size="sm")
+                    teach_dl_file = gr.File(label="Download", visible=False)
                     teach_status = gr.Markdown()
                 with gr.Column(scale=2):
-                    teach_gallery = gr.Gallery(
-                        label="Slides", columns=2, height=700,
-                        show_label=False, object_fit="contain",
+                    teach_pinned_label = gr.Markdown(visible=False)
+                    teach_pinned_gallery = gr.Gallery(
+                        label="Pinned (previous)", columns=2, height=350,
+                        show_label=True, object_fit="contain", visible=False,
                     )
+                    teach_gallery = gr.Gallery(
+                        label="Current", columns=2, height=700,
+                        show_label=True, object_fit="contain",
+                    )
+
+            def _render_and_track(*args):
+                global _LAST_SLIDE_DIR
+                gallery, status, slide_dir = render_teach(*args)
+                _LAST_SLIDE_DIR = slide_dir
+                return gallery, status
+
             teach_btn.click(
-                render_teach,
+                _render_and_track,
                 inputs=[teach_prompt, teach_layer, teach_head, teach_qpos,
                         teach_temp, teach_topk, teach_topp],
                 outputs=[teach_gallery, teach_status],
+            )
+
+            def _pin_current(current_gallery, status_text):
+                global _PINNED_GALLERY, _PINNED_LABEL
+                if not current_gallery:
+                    return gr.update(), gr.update(), gr.update()
+                _PINNED_GALLERY = current_gallery
+                _PINNED_LABEL = status_text or "Pinned"
+                return (
+                    gr.update(value=current_gallery, visible=True),
+                    gr.update(value=f"**Pinned:** {_PINNED_LABEL}", visible=True),
+                    gr.update(value=700, height=350),  # shrink current gallery
+                )
+
+            teach_pin_btn.click(
+                _pin_current,
+                inputs=[teach_gallery, teach_status],
+                outputs=[teach_pinned_gallery, teach_pinned_label, teach_gallery],
+            )
+
+            def _download_pptx(status_text):
+                global _LAST_SLIDE_DIR
+                if not _LAST_SLIDE_DIR:
+                    return gr.update(visible=False)
+                label = status_text or "Train Reports"
+                path = export_slides_pptx(_LAST_SLIDE_DIR, label)
+                if path and os.path.exists(path):
+                    return gr.update(value=path, visible=True)
+                return gr.update(visible=False)
+
+            teach_dl_btn.click(
+                _download_pptx,
+                inputs=[teach_status],
+                outputs=[teach_dl_file],
             )
 
         # ── Tab 5: Attention (per-head heatmaps) ──
