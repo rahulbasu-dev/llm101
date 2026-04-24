@@ -359,6 +359,7 @@
 
   // ── Scoped DOM queries ──
   var root = document.querySelector(".nanollm-viz");
+  if (!root) { console.error("nanollm-viz: root not found"); return; }
   function q(sel)  { return root.querySelector(sel); }
 
   // ── Animation state ──

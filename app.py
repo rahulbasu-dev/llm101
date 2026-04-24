@@ -596,14 +596,33 @@ def _get_viz_template() -> str:
 
 
 def render_visualization(prompt: str) -> str:
-    """Collect tensors and return the animated HTML visualization."""
+    """Collect tensors and return the animated HTML visualization.
+
+    Gradio's gr.HTML does NOT execute <script> tags (static HTML only).
+    We wrap the visualization in an <iframe srcdoc="..."> which creates
+    a sandboxed document that does execute scripts.
+    """
     import json
+    import html as html_lib
     model, tokenizer, config = _require_loaded()
     data = collect_viz_data(model, tokenizer, prompt, config)
     template = _get_viz_template()
     json_str = json.dumps(data)
-    html = template.replace("{{VIZ_DATA_JSON}}", json_str)
-    return html
+    inner_html = template.replace("{{VIZ_DATA_JSON}}", json_str)
+    # Wrap in a full HTML document for the iframe
+    doc = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<style>body{margin:0;background:#0f172a;}</style></head>'
+        f'<body>{inner_html}</body></html>'
+    )
+    # Escape for srcdoc attribute (HTML entity encoding)
+    escaped = html_lib.escape(doc, quote=True)
+    iframe = (
+        f'<iframe srcdoc="{escaped}" '
+        f'style="width:100%;height:750px;border:none;border-radius:8px;" '
+        f'sandbox="allow-scripts"></iframe>'
+    )
+    return iframe
 
 
 # ═══════════════════════════════════════════════════════════════
