@@ -1,4 +1,4 @@
-"""Smoke tests for the Gradio webinar console.
+"""Smoke tests for the Gradio console.
 
 These tests catch wiring bugs (bad imports, missing components, broken handler
 signatures) without actually launching a server. They don't click any buttons —

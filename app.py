@@ -1,4 +1,4 @@
-"""LLM101 — Webinar Console (Gradio UI).
+"""LLM101 - Console (Gradio UI).
 
 A single browser app with seven tabs:
   1. Generate      — live token streaming; toggle KV cache on/off to see speed
@@ -15,7 +15,7 @@ at startup.
 
 Run:
     python app.py
-    python app.py --share           # phone-home for a public URL (webinar mode)
+    python app.py --share           # phone-home for a public URL
     python app.py --port 7861
     bash run.sh ui
 """
@@ -853,7 +853,7 @@ _BUILD_STEPS: list[tuple[str, str, str | None]] = [
     ),
     (
         "10 · Gradio web UI  ·  `app.py`  (this page!)",
-        "A single browser app as the webinar entrypoint. All handlers import "
+        "A single browser app entrypoint. All handlers import "
         "and call existing functions from `teach.py` and `visualise.py` — no "
         "logic re-implemented.\n\n"
         "**Two Gradio patterns worth learning:**\n\n"
@@ -1094,10 +1094,10 @@ def build_ui() -> gr.Blocks:
     n_heads = _CONFIG.n_heads if _CONFIG is not None else 6
     max_seq = _CONFIG.max_seq_len if _CONFIG is not None else 256
 
-    with gr.Blocks(title="LLM101 — Webinar Console",
+    with gr.Blocks(title="LLM101 - Console",
                    theme=gr.themes.Soft(primary_hue="blue")) as demo:
         gr.Markdown(
-            "# LLM101 — Webinar Console\n"
+            "# LLM101 - Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
             "Tabs mirror the notebook: **Tokenizer** (§2) · **Dataset** (§3) · "
             "**Components** (§4) · **Train** (§6) · **Train Reports** (§5) · "
@@ -1781,7 +1781,7 @@ def find_free_port(start_port: int, host: str = "127.0.0.1",
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM101 — Gradio webinar console")
+    parser = argparse.ArgumentParser(description="LLM101 - Gradio console")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--port", type=int, default=7860,
                         help="Preferred starting port (will auto-fallback if busy)")
@@ -1791,7 +1791,7 @@ def main():
                         help="Bind address (use 0.0.0.0 to expose on LAN)")
     args = parser.parse_args()
 
-    print("LLM101 Webinar Console — starting...")
+    print("LLM101 Console — starting...")
     _load_model(args.checkpoint)
     print(f"  {_STATUS}")
 

@@ -270,7 +270,7 @@ do_test() {
     PYTHONIOENCODING=utf-8 python3 -m pytest tests/ "$@"
 }
 
-# ── UI (Gradio webinar console) ─────────────────────────────
+# ── UI (Gradio console) ─────────────────────────────────────
 do_ui() {
     source .venv/bin/activate 2>/dev/null || true
     # Gradio 5.x — 4.44 has a schema-introspection bug that crashes on launch.
@@ -278,9 +278,39 @@ do_ui() {
         echo -e "${YELLOW}Installing/upgrading gradio to 5.x...${NC}"
         pip install "gradio>=5,<6" -q
     fi
-    echo -e "${GREEN}Launching LLM101 Webinar Console on http://127.0.0.1:7860 ...${NC}"
-    echo -e "${YELLOW}Tip: add --share for a public URL (webinar mode)${NC}"
+    echo -e "${GREEN}Launching LLM101 Console on http://127.0.0.1:7860 ...${NC}"
+    echo -e "${YELLOW}Tip: add --share for a public URL${NC}"
     PYTHONIOENCODING=utf-8 python3 app.py "$@"
+}
+
+# ── Notebook (JupyterLab in the WSL venv with CUDA-enabled torch) ──
+#
+# Solves a recurring sharp edge: launching jupyter from native Windows
+# Python pulls in a +cpu PyTorch wheel and reports "no GPU" even on a
+# CUDA-capable machine. Running from this venv reuses the cu121 build
+# that `do_setup` installed, so torch.cuda.is_available() is True.
+#
+# Lazy-installs jupyterlab on first invocation (kept out of `setup` so
+# users who only want CLI training don't pay the ~30 MB).
+do_notebook() {
+    source .venv/bin/activate 2>/dev/null || true
+    if ! python3 -c "import jupyterlab" 2>/dev/null; then
+        echo -e "${YELLOW}Installing jupyterlab into .venv...${NC}"
+        pip install jupyterlab -q
+    fi
+    # If a notebook filename was passed as the first arg, default to opening it.
+    # Otherwise just open the file browser.
+    local target="LLM101_From_Scratch.ipynb"
+    [ -n "$1" ] && target="$1" && shift
+
+    echo -e "${GREEN}Launching JupyterLab on http://127.0.0.1:8888 ...${NC}"
+    echo -e "${YELLOW}  Open a terminal inside Jupyter: File -> New -> Terminal${NC}"
+    echo -e "${YELLOW}  The kernel uses this venv's torch (CUDA cu121, sees the GPU)${NC}"
+    PYTHONIOENCODING=utf-8 python3 -m jupyterlab \
+        --no-browser \
+        --ip=127.0.0.1 \
+        --ServerApp.root_dir="$SCRIPT_DIR" \
+        "$target" "$@"
 }
 
 # ── Verify (GPU + shape test + tokenizer test) ──────────────
@@ -417,15 +447,16 @@ fi
 banner
 
 case "${1:-help}" in
-    setup)      do_setup ;;
-    train)      shift; do_train "$@" ;;
-    generate)   shift; do_generate "$@" ;;
-    visualise)  shift; do_visualise "$@" ;;
-    teach)      shift; do_teach "$@" ;;
-    benchmark)  shift; do_benchmark "$@" ;;
-    test)       shift; do_test "$@" ;;
-    ui)         shift; do_ui "$@" ;;
-    verify)     do_verify ;;
+    setup)            do_setup ;;
+    train)            shift; do_train "$@" ;;
+    generate)         shift; do_generate "$@" ;;
+    visualise)        shift; do_visualise "$@" ;;
+    teach)            shift; do_teach "$@" ;;
+    benchmark)        shift; do_benchmark "$@" ;;
+    test)             shift; do_test "$@" ;;
+    ui)               shift; do_ui "$@" ;;
+    notebook|lab)     shift; do_notebook "$@" ;;
+    verify)           do_verify ;;
     *)
         echo "Usage: bash run.sh <command>"
         echo
@@ -434,11 +465,14 @@ case "${1:-help}" in
         echo "  verify     Quick test — verify model shapes and tokenizer"
         echo "  train      Train LLM101 (~5 min GPU, ~30 min CPU)"
         echo "  generate   Interactive text generation from trained model"
-        echo "  visualise  Generate attention heatmaps (for webinar slides)"
+        echo "  visualise  Generate attention heatmaps (for slide decks)"
         echo "  teach      Generate 16-slide step-by-step forward-pass walkthrough"
         echo "  benchmark  Compare generate() vs generate_fast() (KV-cache speedup)"
         echo "  test       Run pytest suite on mock data (CPU, no training data needed)"
-        echo "  ui         Launch Gradio webinar console (7-tab interface)"
+        echo "  ui         Launch Gradio console (10-tab interface)"
+        echo "  notebook   Launch JupyterLab in this venv (CUDA-enabled torch)"
+        echo "             Alias: 'lab'. Opens LLM101_From_Scratch.ipynb by default;"
+        echo "             pass a different filename to open another notebook."
         echo
         echo "Quick start:"
         echo "  bash run.sh setup"
@@ -447,5 +481,6 @@ case "${1:-help}" in
         echo "  bash run.sh generate --fast"
         echo "  bash run.sh teach"
         echo "  bash run.sh benchmark"
+        echo "  bash run.sh notebook"
         ;;
 esac

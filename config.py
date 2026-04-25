@@ -147,6 +147,11 @@ class NanoLLMConfig:
 
     @property
     def device(self) -> torch.device:
+        # Honour NANOLLM_ALLOW_CPU=1 so tests (and CPU-only demos) stay on CPU
+        # even when running on a CUDA-capable machine. Without this, fixtures
+        # built on CPU collide with handler tensors created on cuda:0.
+        if os.environ.get("NANOLLM_ALLOW_CPU") == "1":
+            return torch.device("cpu")
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property

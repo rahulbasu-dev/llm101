@@ -5,7 +5,7 @@ Generates:
   2. Attention rollout (effective attention through all layers combined)
   3. Token-level analysis (what a specific token attends to)
 
-Great for webinar slides — shows the model learning syntax and semantics.
+Great for slide decks — shows the model learning syntax and semantics.
 
 Usage:
     python visualise.py

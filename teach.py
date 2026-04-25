@@ -2,7 +2,7 @@
 
 Produces a numbered sequence of annotated PNG "slides" in teaching_plots/
 that walk through what happens when a single prompt passes through the model.
-Designed for a webinar or classroom.
+Designed for classroom use.
 
 Usage:
     python teach.py                                 # default prompt
