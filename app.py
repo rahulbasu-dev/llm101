@@ -63,6 +63,7 @@ from visualise import AttentionCapture, compute_attention_rollout, plot_attentio
 from visualize_anim import collect_viz_data
 import build_viz
 import effect_viz
+import notebook_viz as nv
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -993,6 +994,96 @@ def render_step_panel(step_idx: int) -> tuple[str, str | None]:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Notebook-derived tabs (Tokenizer / Dataset / Components / KV Cache)
+#
+# Mirror sections 2, 3, 4, and 9 of LLM101_From_Scratch.ipynb. The
+# pure-render helpers live in notebook_viz.py; the handlers below are
+# thin glue that writes the returned Figures to a tempdir.
+# ═══════════════════════════════════════════════════════════════
+
+def _save_fig(fig, prefix: str = "nanollm_viz_") -> str:
+    """Write a matplotlib Figure to a fresh tempdir and return the PNG path."""
+    outdir = tempfile.mkdtemp(prefix=prefix)
+    path = os.path.join(outdir, "viz.png")
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
+def run_tokenizer(text: str):
+    """Encode user text → breakdown text + vocab/compression overview chart."""
+    _, tokenizer, _ = _require_loaded()
+    text = text or "Hello world!"
+    breakdown = nv.encode_breakdown(tokenizer, text)
+    return nv.format_breakdown(breakdown), _save_fig(
+        nv.draw_tokenizer_overview(tokenizer), "nanollm_tok_"
+    )
+
+
+def run_dataset(text: str, seq_len: int, stride: int, sample_idx: int):
+    """Tokenize the input text and render the input/target shift + windows."""
+    _, tokenizer, config = _require_loaded()
+    text = text or ("Once upon a time, a little cat sat on the mat. " * 20)
+    tokens = tokenizer.encode(text, add_special=False)
+    if not tokens:
+        return None, "Empty tokenization."
+    seq_len = max(2, min(int(seq_len), config.max_seq_len, max(2, len(tokens) - 1)))
+    stride = max(1, int(stride))
+    sample_idx = max(0, int(sample_idx))
+    fig = nv.draw_window_view(
+        tokenizer, tokens, seq_len=seq_len, stride=stride,
+        sample_idx=sample_idx, n_show=min(12, seq_len),
+    )
+    summary = (f"Tokenized: {len(text):,} chars → {len(tokens):,} tokens · "
+               f"seq_len={seq_len}, stride={stride}, sample_idx={sample_idx}")
+    return _save_fig(fig, "nanollm_ds_"), summary
+
+
+def run_component(name: str):
+    """Render the (text, figure) pair for one Components sub-tab."""
+    _, _, config = _require_loaded()
+    if name == "rmsnorm":
+        return nv.rmsnorm_summary(config), _save_fig(
+            nv.draw_rmsnorm_dist(config), "nanollm_rmsnorm_")
+    if name == "rope":
+        return nv.rope_summary(config), _save_fig(
+            nv.draw_rope_demo(config), "nanollm_rope_")
+    if name == "attention":
+        return nv.attention_summary(config), _save_fig(
+            nv.draw_causal_mask(config), "nanollm_attn_")
+    if name == "swiglu":
+        return nv.swiglu_summary(config), _save_fig(
+            nv.draw_swiglu_breakdown(config), "nanollm_swiglu_")
+    raise ValueError(f"Unknown component: {name}")
+
+
+def run_kv_cache(seq_len: int, multi_T: int, sweep_str: str, gen_len: int):
+    """§9 deep-dive: single-step + multi-step equivalence + length-sweep timing."""
+    model, _, config = _require_loaded()
+    seq_len = int(seq_len)
+    multi_T = int(multi_T)
+    gen_len = int(gen_len)
+
+    single = nv.format_kv_single_step(
+        nv.kv_cache_single_step(model, config, T=seq_len)
+    )
+    multi = nv.format_kv_multi_step(
+        nv.kv_cache_multi_step(model, config, T=multi_T)
+    )
+
+    try:
+        prompt_lens = [int(p.strip()) for p in sweep_str.split(",") if p.strip()]
+    except ValueError:
+        prompt_lens = []
+    if not prompt_lens:
+        prompt_lens = [5, 10, 20, 40]
+
+    fig, sweep_text = nv.draw_length_sweep(model, config, prompt_lens,
+                                           gen_len=gen_len)
+    return single, multi, _save_fig(fig, "nanollm_kv_sweep_"), sweep_text
+
+
+# ═══════════════════════════════════════════════════════════════
 # UI layout
 # ═══════════════════════════════════════════════════════════════
 
@@ -1008,9 +1099,10 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "# LLM101 — Webinar Console\n"
             "A ~15M-parameter GPT-style transformer, built from scratch. "
-            "Tabs follow the build → train → explore workflow: "
-            "**Train** → **Train Reports** → **Attention** → "
-            "**Visualize** → **Generate** → **Benchmark**."
+            "Tabs mirror the notebook: **Tokenizer** (§2) · **Dataset** (§3) · "
+            "**Components** (§4) · **Train** (§6) · **Train Reports** (§5) · "
+            "**Attention** / **Visualize** (§8) · **Generate** (§7) · "
+            "**Benchmark** + **KV Cache** (§9)."
         )
         gr.Markdown(_STATUS)
 
@@ -1081,6 +1173,143 @@ def build_ui() -> gr.Blocks:
                 inputs=None,
                 outputs=[build_md, build_img],
             )
+
+        # ── Notebook tab: Tokenizer (notebook §2) ──
+        with gr.Tab("Tokenizer"):
+            gr.Markdown(
+                "### Byte-level BPE — see exactly how text becomes tokens\n\n"
+                "Mirrors **§2** of `LLM101_From_Scratch.ipynb`. Type any text "
+                "and see the encode/decode round-trip with a per-token kind "
+                "label (SPECIAL · BYTE · MERGE), plus the vocabulary "
+                "composition and the BPE compression ratio across sample texts."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    tok_in = gr.Textbox(
+                        label="Text to tokenize",
+                        value="To be, or not to be, that is the question.",
+                        lines=3,
+                    )
+                    tok_btn = gr.Button("Tokenize", variant="primary")
+                    tok_breakdown = gr.Code(
+                        label="Round-trip breakdown",
+                        language=None, interactive=False,
+                    )
+                with gr.Column(scale=1):
+                    tok_overview = gr.Image(
+                        label="Vocabulary composition + compression",
+                        type="filepath",
+                    )
+            tok_btn.click(run_tokenizer,
+                          inputs=[tok_in],
+                          outputs=[tok_breakdown, tok_overview])
+            demo.load(run_tokenizer, inputs=[tok_in],
+                      outputs=[tok_breakdown, tok_overview])
+
+        # ── Notebook tab: Dataset (notebook §3) ──
+        with gr.Tab("Dataset"):
+            gr.Markdown(
+                "### Sliding-window dataset — input vs target shift, window overlap\n\n"
+                "Mirrors **§3** of the notebook. The corpus is encoded once, "
+                "then sliced into overlapping windows of length `seq_len` with "
+                "the chosen `stride`. For causal LM, **target = input shifted "
+                "right by 1**: at every position the model predicts the *next* "
+                "token from everything to its left."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    ds_text = gr.Textbox(
+                        label="Source text (will be tokenized)",
+                        value=("Once upon a time, a little cat sat on the mat. "
+                               "The dog watched, then chased a bird. "
+                               "Tomorrow we will go to the park. " * 8),
+                        lines=4,
+                    )
+                    ds_seq = gr.Slider(
+                        4, max_seq, value=min(32, max_seq), step=4,
+                        label="seq_len (window length)",
+                    )
+                    ds_stride = gr.Slider(
+                        1, max_seq, value=min(16, max_seq), step=1,
+                        label="stride (offset between windows)",
+                        info="stride = seq_len/2 by default, giving 50% overlap.",
+                    )
+                    ds_idx = gr.Slider(
+                        0, 8, value=0, step=1,
+                        label="sample index (which window to inspect)",
+                    )
+                    ds_btn = gr.Button("Render windows", variant="primary")
+                    ds_status = gr.Markdown()
+                with gr.Column(scale=2):
+                    ds_img = gr.Image(label="Shift + windows", type="filepath")
+            ds_btn.click(run_dataset,
+                         inputs=[ds_text, ds_seq, ds_stride, ds_idx],
+                         outputs=[ds_img, ds_status])
+            demo.load(run_dataset,
+                      inputs=[ds_text, ds_seq, ds_stride, ds_idx],
+                      outputs=[ds_img, ds_status])
+
+        # ── Notebook tab: Components (notebook §4a–d) ──
+        with gr.Tab("Components"):
+            gr.Markdown(
+                "### Atomic components — RMSNorm · RoPE · Attention · SwiGLU\n\n"
+                "Mirrors **§4** of the notebook. Each sub-tab instantiates "
+                "**one** sub-module against the current config and shows what "
+                "it does in isolation, before they're stacked into the full "
+                "TransformerBlock. Numbers update if you re-train with a "
+                "different config."
+            )
+            with gr.Tab("RMSNorm"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        rms_txt = gr.Code(label="Summary", language=None,
+                                          interactive=False)
+                    with gr.Column(scale=1):
+                        rms_img = gr.Image(
+                            label="Activation distribution before / after",
+                            type="filepath",
+                        )
+                demo.load(lambda: run_component("rmsnorm"),
+                          inputs=None, outputs=[rms_txt, rms_img])
+
+            with gr.Tab("RoPE"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        rope_txt = gr.Code(label="Summary", language=None,
+                                           interactive=False)
+                    with gr.Column(scale=2):
+                        rope_img = gr.Image(
+                            label="cos / sin tables + unit-vector rotation",
+                            type="filepath",
+                        )
+                demo.load(lambda: run_component("rope"),
+                          inputs=None, outputs=[rope_txt, rope_img])
+
+            with gr.Tab("Attention"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        cmask_txt = gr.Code(label="Summary", language=None,
+                                            interactive=False)
+                    with gr.Column(scale=1):
+                        cmask_img = gr.Image(
+                            label="Causal mask (1 = visible, 0 = masked)",
+                            type="filepath",
+                        )
+                demo.load(lambda: run_component("attention"),
+                          inputs=None, outputs=[cmask_txt, cmask_img])
+
+            with gr.Tab("SwiGLU"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        sw_txt = gr.Code(label="Summary", language=None,
+                                         interactive=False)
+                    with gr.Column(scale=1):
+                        sw_img = gr.Image(
+                            label="Parameter breakdown across 3 projections",
+                            type="filepath",
+                        )
+                demo.load(lambda: run_component("swiglu"),
+                          inputs=None, outputs=[sw_txt, sw_img])
 
         # ── Tab 2: Train (train the model) ──
         with gr.Tab("Train"):
@@ -1462,6 +1691,59 @@ def build_ui() -> gr.Blocks:
                 run_bench,
                 inputs=[bench_prompt, bench_n],
                 outputs=[bench_img, bench_summary],
+            )
+
+        # ── Notebook tab: KV Cache deep dive (notebook §9) ──
+        with gr.Tab("KV Cache"):
+            gr.Markdown(
+                "### KV cache — equivalence proofs + length sweep\n\n"
+                "Mirrors **§9** of the notebook. The Benchmark tab measures "
+                "throughput on one prompt; this tab does the deeper analysis:\n\n"
+                "1. **Single-step equivalence** — full forward on T tokens vs. "
+                "(prefill on T-1) + (1-token decode with cache). Should match "
+                "to ~`1e-7`.\n"
+                "2. **Multi-step equivalence** — feed tokens one at a time "
+                "through the cache, compare the final-position logits to a "
+                "single full forward.\n"
+                "3. **Length sweep** — generate `gen_len` new tokens at "
+                "varying prompt lengths and compare `generate()` vs "
+                "`generate_fast()`.\n\n"
+                "If any equivalence test fails, attention or RoPE has a bug — "
+                "this is the canary that `tests/test_model.py::test_kv_cache_*` "
+                "guards in CI."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    kv_T = gr.Slider(
+                        4, max_seq, value=min(16, max_seq), step=1,
+                        label="single-step: sequence length T",
+                    )
+                    kv_multi_T = gr.Slider(
+                        4, max_seq, value=min(20, max_seq), step=1,
+                        label="multi-step: tokens fed one-by-one",
+                    )
+                    kv_sweep = gr.Textbox(
+                        label="length-sweep prompt lengths (comma-separated)",
+                        value="5, 10, 20, 40",
+                    )
+                    kv_gen = gr.Slider(
+                        10, max(20, max_seq - 50), value=min(50, max_seq // 2),
+                        step=10, label="length-sweep: tokens to generate",
+                    )
+                    kv_btn = gr.Button("Run all 3 tests", variant="primary")
+                    kv_single = gr.Code(label="Single-step", language=None,
+                                        interactive=False)
+                    kv_multi = gr.Code(label="Multi-step", language=None,
+                                       interactive=False)
+                with gr.Column(scale=2):
+                    kv_sweep_img = gr.Image(label="Length-sweep timing",
+                                            type="filepath")
+                    kv_sweep_txt = gr.Code(label="Length-sweep numbers",
+                                           language=None, interactive=False)
+            kv_btn.click(
+                run_kv_cache,
+                inputs=[kv_T, kv_multi_T, kv_sweep, kv_gen],
+                outputs=[kv_single, kv_multi, kv_sweep_img, kv_sweep_txt],
             )
 
         gr.Markdown(
