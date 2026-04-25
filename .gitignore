@@ -25,7 +25,8 @@ teaching_plots_smoke/
 Thumbs.db
 
 # Project-specific
-docs/
+docs/*
+!docs/REFERENCES.md
 reference/
 files.zip
 *.pt
@@ -37,6 +38,7 @@ gen_pptx.py
 # Logs
 *.log
 
-# Markdown files (except README.md)
+# Markdown files (except README.md and the README's REFERENCES link target)
 *.md
 !README.md
+!docs/REFERENCES.md
