@@ -38,7 +38,6 @@ gen_pptx.py
 # Logs
 *.log
 
-# Markdown files (except README.md and the README's REFERENCES link target)
+# Markdown files (except README.md)
 *.md
 !README.md
-!docs/REFERENCES.md

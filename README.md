@@ -5,8 +5,7 @@ Every component is written explicitly — RMSNorm, RoPE, SwiGLU, causal self-att
 weight tying — so you can see exactly how modern LLMs work inside.
 
 Aligned with Sebastian Raschka's
-[Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch)
-— see [REFERENCES.md](REFERENCES.md) for the chapter cross-walk.
+[Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch).
 
 ## Quick Start
 
