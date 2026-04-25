@@ -1,3 +1,5 @@
+*gh repo clone rahulbasu-dev/llm101*
+
 # LLM101 — Build a Language Model From Scratch
 
 A ~15M-parameter GPT-style decoder-only Transformer in ~800 lines of PyTorch.
