@@ -236,7 +236,7 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
             _dummy = torch.randint(0, config.vocab_size,
                                    (2, config.max_seq_len), device=device)
             with torch.no_grad():
-                model(_dummy)
+                model(_dummy, _dummy)  # include targets to compile the training-step graph
             del _dummy
             compile_secs = time.time() - t_compile
             compiled = True

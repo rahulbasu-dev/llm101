@@ -49,7 +49,7 @@ from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM, _sample_from_logits
 from train import train_iter, save_loss_curve
-from teach import (
+from forward_viz import (
     ForwardCapture, token_labels, _get_plt,
     slide_01_tokenization, slide_02_embeddings, slide_03_qkv,
     slide_04_scores_raw, slide_05_scores_masked, slide_06_attn_weights,
@@ -1474,8 +1474,12 @@ def build_ui() -> gr.Blocks:
 
             def _render_and_track(*args):
                 global _LAST_SLIDE_DIR
+                import shutil
+                old_dir = _LAST_SLIDE_DIR
                 gallery, status, slide_dir = render_teach(*args)
                 _LAST_SLIDE_DIR = slide_dir
+                if old_dir and os.path.isdir(old_dir):
+                    shutil.rmtree(old_dir, ignore_errors=True)
                 return gallery, status
 
             teach_btn.click(

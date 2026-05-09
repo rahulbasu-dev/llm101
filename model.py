@@ -303,10 +303,8 @@ class NanoLLM(nn.Module):
             if pn.endswith("out_proj.weight") or pn.endswith("down_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
-        n_params = sum(p.numel() for p in self.parameters())
-        # Weight-tied params counted once
-        n_params -= self.token_emb.weight.numel()
-        n_params += self.token_emb.weight.numel()
+        # Deduplicate by tensor identity so tied weights are counted once.
+        n_params = sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
         print(f"LLM101 initialised: {n_params:,} parameters ({n_params/1e6:.2f}M)")
 
     def _init_weights(self, module):

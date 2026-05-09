@@ -250,9 +250,9 @@ do_teach() {
     source .venv/bin/activate 2>/dev/null || true
     echo -e "${GREEN}Generating teaching slides (16-step forward-pass walkthrough)...${NC}"
     if [ -n "$1" ]; then
-        python3 teach.py --text "$@"
+        python3 forward_viz.py --text "$@"
     else
-        python3 teach.py
+        python3 forward_viz.py
     fi
 }
 

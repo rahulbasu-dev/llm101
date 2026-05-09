@@ -5,9 +5,9 @@ that walk through what happens when a single prompt passes through the model.
 Designed for classroom use.
 
 Usage:
-    python teach.py                                 # default prompt
-    python teach.py --text "The cat sat on the"
-    python teach.py --checkpoint checkpoints/best.pt --layer 0 --head 0
+    python forward_viz.py                                 # default prompt
+    python forward_viz.py --text "The cat sat on the"
+    python forward_viz.py --checkpoint checkpoints/best.pt --layer 0 --head 0
 
 Slides produced:
     01_tokenization.png      — text -> bytes -> BPE -> token IDs             [Raschka Ch 2]
@@ -55,7 +55,7 @@ def _get_plt():
         import matplotlib.pyplot as plt
         return plt
     except ImportError:
-        print("ERROR: matplotlib is required for teach.py. Install with:")
+        print("ERROR: matplotlib is required for forward_viz.py. Install with:")
         print("  pip install matplotlib")
         sys.exit(1)
 

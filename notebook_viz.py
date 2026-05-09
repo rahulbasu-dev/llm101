@@ -321,13 +321,13 @@ def draw_rope_demo(config: NanoLLMConfig, show_pos: int = 64) -> plt.Figure:
     axes[0].set_title("cos(pos · θᵢ)", fontsize=12, fontweight="bold")
     axes[0].set_xlabel("Frequency index i")
     axes[0].set_ylabel("Position")
-    plt.colorbar(im1, ax=axes[0], shrink=0.8)
+    fig.colorbar(im1, ax=axes[0], shrink=0.8)
 
     im2 = axes[1].imshow(sin_table[:show_pos], aspect="auto",
                          cmap="RdBu_r", vmin=-1, vmax=1)
     axes[1].set_title("sin(pos · θᵢ)", fontsize=12, fontweight="bold")
     axes[1].set_xlabel("Frequency index i")
-    plt.colorbar(im2, ax=axes[1], shrink=0.8)
+    fig.colorbar(im2, ax=axes[1], shrink=0.8)
 
     positions = [p for p in [0, 2, 4, 8, 16, 32] if p < show_pos]
     colors_pos = plt.cm.viridis(np.linspace(0.15, 0.85, len(positions)))

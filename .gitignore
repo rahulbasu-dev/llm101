@@ -24,6 +24,13 @@ teaching_plots_smoke/
 .DS_Store
 Thumbs.db
 
+# Tests (local only)
+tests/
+
+# Standalone scripts not needed to run the app
+generate.py
+LLM101_From_Scratch.ipynb
+
 # Project-specific
 docs/*
 !docs/REFERENCES.md
