@@ -19,7 +19,9 @@ Architecture:
 from __future__ import annotations
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
 import math
 from typing import Iterator
@@ -116,7 +118,8 @@ def save_loss_curve(train_history, epoch_history, path):
 # Core: training as a generator of events
 # ═══════════════════════════════════════════════════════════════
 
-def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
+def train_iter(config: NanoLLMConfig | None = None,
+               stop_event: "threading.Event | None" = None) -> Iterator[dict]:
     """Training loop as an event generator.
 
     Yields dicts with a "type" field:
@@ -174,12 +177,48 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
     config.vocab_size = tokenizer.vocab_size
     yield {"type": "log", "msg": f"Vocab size: {config.vocab_size}"}
 
-    # ── Tokenise & split ──
-    yield {"type": "log", "msg": "Tokenising corpus..."}
-    tokens = tokenizer.encode(raw_text, add_special=False)
-    yield {"type": "log",
-           "msg": f"Tokens: {len(tokens):,} "
-                  f"(compression ratio: {len(raw_text)/len(tokens):.2f}x)"}
+    # ── Tokenise & split (with disk cache keyed on corpus + tokenizer) ──
+    import hashlib, numpy as _np
+    _corpus_hash = hashlib.md5(raw_text[:65536].encode()).hexdigest()[:8]
+    _tok_hash = hashlib.md5(str(tokenizer.merges[:20]).encode()).hexdigest()[:8]
+    _cache_path = os.path.join(os.path.dirname(config.data_path),
+                               f"tokens_{_corpus_hash}_{_tok_hash}.npy")
+
+    if os.path.exists(_cache_path):
+        yield {"type": "log", "msg": f"Loading cached tokens from {_cache_path}..."}
+        tokens = _np.load(_cache_path).tolist()
+        yield {"type": "log",
+               "msg": f"Tokens: {len(tokens):,} "
+                      f"(compression ratio: {len(raw_text)/len(tokens):.2f}x)  [from cache]"}
+    else:
+        yield {"type": "log",
+               "msg": f"Tokenising corpus ({len(tokenizer.merges):,} BPE merges)..."}
+        _prog_q: queue.Queue = queue.Queue()
+        _result: list = [None]
+        _tok_t0 = time.time()
+
+        def _run_encode() -> None:
+            def _cb(done: int, total: int) -> None:
+                elapsed = time.time() - _tok_t0
+                _prog_q.put({"type": "log",
+                             "msg": f"  tokenising: {100 * done // total}%  "
+                                    f"({done:,} / {total:,} merges)  "
+                                    f"[{elapsed:.1f}s]"})
+            _result[0] = tokenizer.encode(raw_text, add_special=False, progress_cb=_cb)
+            _prog_q.put(None)
+
+        threading.Thread(target=_run_encode, daemon=True).start()
+        while True:
+            evt = _prog_q.get()
+            if evt is None:
+                break
+            yield evt
+        tokens = _result[0]
+        _np.save(_cache_path, _np.array(tokens, dtype=_np.int32))
+        yield {"type": "log",
+               "msg": f"Tokens: {len(tokens):,} "
+                      f"(compression ratio: {len(raw_text)/len(tokens):.2f}x)  "
+                      f"[cached to {_cache_path}]"}
 
     split = int(0.9 * len(tokens))
     train_tokens, val_tokens = tokens[:split], tokens[split:]
@@ -229,14 +268,16 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
                "msg": "Compiling model (torch.compile) — one-time ~60s cost "
                       "that pays back ~1.5-2× faster steps..."}
         t_compile = time.time()
+        _original_model = model
         try:
+            # suppress_errors makes torch fall back to eager if Triton is missing
+            import torch._dynamo as _dynamo
+            _dynamo.config.suppress_errors = True
             model = torch.compile(model)
-            # Trigger compilation with a dummy forward pass so the cost
-            # is visible here, not buried inside the first training step.
             _dummy = torch.randint(0, config.vocab_size,
                                    (2, config.max_seq_len), device=device)
             with torch.no_grad():
-                model(_dummy, _dummy)  # include targets to compile the training-step graph
+                model(_dummy, _dummy)
             del _dummy
             compile_secs = time.time() - t_compile
             compiled = True
@@ -244,10 +285,12 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
                    "msg": f"Compilation done in {compile_secs:.0f}s — "
                           f"training steps will be faster."}
         except Exception as e:
+            model = _original_model  # restore unwrapped model on any failure
             compile_secs = time.time() - t_compile
+            first_line = str(e).splitlines()[0]
             yield {"type": "log",
-                   "msg": f"torch.compile failed ({e}) — "
-                          f"continuing without compilation."}
+                   "msg": f"torch.compile unavailable ({first_line}) — "
+                          f"running in eager mode."}
 
     decay_params, no_decay_params = [], []
     for _, param in model.named_parameters():
@@ -288,8 +331,12 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
         epoch_loss = 0.0
         epoch_tokens = 0
         t_epoch = time.time()
+        t_step = time.time()
 
         for batch_idx, (input_ids, targets) in enumerate(dataloader):
+            if stop_event is not None and stop_event.is_set():
+                yield {"type": "stopped"}
+                return
             input_ids = input_ids.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -314,7 +361,10 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
             global_step += 1
             train_loss_history.append((global_step, batch_loss))
 
-            elapsed = time.time() - t_epoch
+            now = time.time()
+            step_time = now - t_step
+            t_step = now
+            elapsed = now - t_epoch
             tps = epoch_tokens / max(elapsed, 1e-6)
 
             yield {"type": "step",
@@ -322,6 +372,7 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
                    "batch_idx": batch_idx, "total_batches": len(dataloader),
                    "loss": batch_loss, "lr": lr,
                    "grad_norm": float(grad_norm),
+                   "step_time": step_time,
                    "tps": tps}
 
         # ── Epoch summary ──
@@ -382,6 +433,257 @@ def train_iter(config: NanoLLMConfig | None = None) -> Iterator[dict]:
 
     # ── Loss curve & done ──
     curve_path = os.path.join(config.checkpoint_dir, "loss_curve.png")
+    ok = save_loss_curve(train_loss_history, epoch_history, curve_path)
+    yield {"type": "done",
+           "best_val_loss": best_val_loss,
+           "curve_path": curve_path if ok else None}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Fine-tuning: continue from a checkpoint on a custom corpus
+# ═══════════════════════════════════════════════════════════════
+
+def finetune_iter(custom_text: str,
+                  checkpoint_path: str,
+                  config: NanoLLMConfig | None = None,
+                  stop_event: "threading.Event | None" = None) -> Iterator[dict]:
+    """Fine-tune a pre-trained checkpoint on user-supplied text.
+
+    Key differences from train_iter():
+      - Loads an existing checkpoint instead of random init
+      - Uses the tokenizer baked into the checkpoint (no re-training)
+      - custom_text is tokenized in-memory (no corpus file needed)
+      - Default LR is lower (5e-5) to avoid catastrophic forgetting
+      - Checkpoint saved to checkpoints/finetuned.pt
+
+    Yields the same event dict schema as train_iter() so the same
+    UI handler (_train_bg) can drive this generator.
+    """
+    if config is None:
+        config = NanoLLMConfig()
+
+    device = require_cuda()
+
+    yield {"type": "log", "msg": "=" * 60}
+    yield {"type": "log", "msg": "LLM101 Fine-tuning"}
+    yield {"type": "log", "msg": "=" * 60}
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        yield {"type": "log", "msg": f"GPU:   {props.name}"}
+        yield {"type": "log", "msg": f"VRAM:  {props.total_memory / 1e9:.1f} GB"}
+        yield {"type": "log", "msg": f"AMP:   {config.amp_dtype}"}
+    else:
+        yield {"type": "log", "msg": "WARNING: Training on CPU — will be slow."}
+
+    # ── Load checkpoint ──
+    if not os.path.exists(checkpoint_path):
+        yield {"type": "error",
+               "msg": f"Checkpoint not found: {checkpoint_path}. "
+                      "Run training first (Train tab) or provide a valid path."}
+        return
+
+    yield {"type": "log", "msg": f"Loading checkpoint: {checkpoint_path}"}
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    base_config = ckpt["config"]
+    base_epoch = ckpt.get("epoch", 0)
+    base_val_loss = ckpt.get("val_loss", ckpt.get("loss", "?"))
+    yield {"type": "log",
+           "msg": f"Base model: epoch {base_epoch}, val_loss={base_val_loss}"}
+
+    # ── Load tokenizer from checkpoint config ──
+    tokenizer = BPETokenizer(target_vocab_size=base_config.target_vocab_size)
+    if not os.path.exists(base_config.tokenizer_path):
+        yield {"type": "error",
+               "msg": f"Tokenizer not found: {base_config.tokenizer_path}. "
+                      "Make sure tokenizer.json is present alongside the checkpoint."}
+        return
+    tokenizer.load(base_config.tokenizer_path)
+    config.vocab_size = tokenizer.vocab_size
+    yield {"type": "log", "msg": f"Vocab: {config.vocab_size} tokens (from checkpoint)"}
+
+    # ── Tokenize custom text in-memory ──
+    custom_text = custom_text.strip()
+    if len(custom_text) < 200:
+        yield {"type": "error",
+               "msg": "Custom text is too short (< 200 chars). Paste at least a few "
+                      "paragraphs to get meaningful fine-tuning signal."}
+        return
+
+    yield {"type": "log",
+           "msg": f"Tokenising custom text ({len(custom_text):,} chars)..."}
+    tokens = tokenizer.encode(custom_text, add_special=False)
+    yield {"type": "log",
+           "msg": f"Tokens: {len(tokens):,}  "
+                  f"(compression {len(custom_text)/max(len(tokens),1):.2f}×)"}
+
+    if len(tokens) < (base_config.max_seq_len + 1) * 4:
+        yield {"type": "error",
+               "msg": f"Need at least {(base_config.max_seq_len + 1) * 4} tokens "
+                      f"after tokenisation (got {len(tokens)}). Paste more text."}
+        return
+
+    # ── Train/val split (sequential 90/10, same as pre-training) ──
+    split = int(0.9 * len(tokens))
+    train_tokens, val_tokens = tokens[:split], tokens[split:]
+    if len(val_tokens) < base_config.max_seq_len + 1:
+        # For very short texts, use 95/5 split
+        split = int(0.95 * len(tokens))
+        train_tokens, val_tokens = tokens[:split], tokens[split:]
+    yield {"type": "log",
+           "msg": f"Train / Val: {len(train_tokens):,} / {len(val_tokens):,} tokens"}
+
+    # ── Datasets ──
+    train_dataset = TextDataset(train_tokens, base_config.max_seq_len)
+    val_dataset = TextDataset(val_tokens, base_config.max_seq_len)
+    dataloader = create_dataloader(train_dataset, config.batch_size)
+    val_dataloader = create_dataloader(val_dataset, config.batch_size, shuffle=False)
+    total_steps = len(dataloader) * config.max_epochs
+    yield {"type": "log",
+           "msg": f"Batches/epoch: {len(dataloader)} train  {len(val_dataloader)} val  "
+                  f"·  Total steps: {total_steps:,}"}
+
+    # ── Warmup: shorter than pre-training (model is already converged) ──
+    warmup_explicit = getattr(config, "_warmup_explicit", False)
+    if not warmup_explicit:
+        config.warmup_steps = max(10, min(50, total_steps // 10))
+        yield {"type": "log",
+               "msg": f"warmup_steps: {config.warmup_steps} "
+                      f"(~10% of total, short because weights are pre-trained)"}
+
+    # ── Build model from checkpoint ──
+    model = NanoLLM(base_config).to(device)
+    sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in sd):
+        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+    model.load_state_dict(sd)
+    yield {"type": "log",
+           "msg": f"Loaded weights: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params"}
+
+    # ── Optimizer (fresh; lower default LR) ──
+    decay_params, no_decay_params = [], []
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        (decay_params if param.dim() >= 2 else no_decay_params).append(param)
+
+    optimizer = torch.optim.AdamW(
+        [{"params": decay_params, "weight_decay": config.weight_decay},
+         {"params": no_decay_params, "weight_decay": 0.0}],
+        lr=config.learning_rate, betas=(0.9, 0.95), eps=1e-8,
+    )
+    yield {"type": "log",
+           "msg": f"Optimizer: AdamW (lr={config.learning_rate:.1e}  —  "
+                  f"lower than pre-training to prevent catastrophic forgetting)"}
+
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(device.type, enabled=use_amp and base_config.amp_dtype == torch.float16)
+
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    gen_prompts = ["The ", "Once upon a time", "What is"]
+
+    yield {"type": "log", "msg": ""}
+    yield {"type": "log", "msg": "=" * 60}
+    yield {"type": "log", "msg": "Starting fine-tuning..."}
+    yield {"type": "log",
+           "msg": f"Starting loss should be ~{base_val_loss:.2f} (not ~8.3 like random init)"}
+    yield {"type": "log", "msg": "=" * 60}
+
+    global_step = 0
+    best_val_loss = float("inf")
+    train_loss_history = []
+    epoch_history = []
+
+    for epoch in range(1, config.max_epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        epoch_tokens = 0
+        t_epoch = time.time()
+        t_step = time.time()
+
+        for batch_idx, (input_ids, targets) in enumerate(dataloader):
+            if stop_event is not None and stop_event.is_set():
+                yield {"type": "stopped"}
+                return
+            input_ids = input_ids.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            lr = get_lr(global_step, config, total_steps)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+
+            with autocast(device_type=device.type, dtype=base_config.amp_dtype, enabled=use_amp):
+                _, loss = model(input_ids, targets)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+            batch_loss = loss.item()
+            batch_tokens = input_ids.numel()
+            epoch_loss += batch_loss * batch_tokens
+            epoch_tokens += batch_tokens
+            global_step += 1
+            train_loss_history.append((global_step, batch_loss))
+
+            now = time.time()
+            step_time = now - t_step
+            t_step = now
+            tps = epoch_tokens / max(now - t_epoch, 1e-6)
+
+            yield {"type": "step",
+                   "global_step": global_step, "epoch": epoch,
+                   "batch_idx": batch_idx, "total_batches": len(dataloader),
+                   "loss": batch_loss, "lr": lr,
+                   "grad_norm": float(grad_norm),
+                   "step_time": step_time,
+                   "tps": tps}
+
+        avg_loss = epoch_loss / max(epoch_tokens, 1)
+        avg_ppl = math.exp(min(avg_loss, 20))
+        elapsed = time.time() - t_epoch
+        val_loss = evaluate(model, val_dataloader, device, base_config, use_amp)
+        val_ppl = math.exp(min(val_loss, 20))
+        epoch_history.append((epoch, avg_loss, val_loss))
+
+        samples = []
+        model.eval()
+        for prompt_text in gen_prompts:
+            prompt_tokens = tokenizer.encode(prompt_text, add_special=False)
+            prompt_tensor = torch.tensor([prompt_tokens], device=device)
+            with torch.no_grad():
+                output = model.generate(
+                    prompt_tensor, max_new_tokens=60,
+                    temperature=base_config.temperature,
+                    top_k=base_config.top_k, top_p=base_config.top_p,
+                )
+            generated = tokenizer.decode(output[0].tolist())[:200]
+            samples.append(generated)
+        model.train()
+
+        yield {"type": "epoch",
+               "epoch": epoch, "max_epochs": config.max_epochs,
+               "train_loss": avg_loss, "val_loss": val_loss,
+               "train_ppl": avg_ppl, "val_ppl": val_ppl,
+               "elapsed": elapsed,
+               "samples": samples}
+
+        raw_model = getattr(model, "_orig_mod", model)
+        ft_path = os.path.join(config.checkpoint_dir, "finetuned.pt")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                "epoch": epoch, "global_step": global_step,
+                "model_state_dict": raw_model.state_dict(),
+                "loss": avg_loss, "val_loss": val_loss,
+                "config": base_config,
+            }, ft_path)
+            yield {"type": "best", "epoch": epoch,
+                   "val_loss": val_loss, "path": ft_path}
+
+    curve_path = os.path.join(config.checkpoint_dir, "ft_loss_curve.png")
     ok = save_loss_curve(train_loss_history, epoch_history, curve_path)
     yield {"type": "done",
            "best_val_loss": best_val_loss,

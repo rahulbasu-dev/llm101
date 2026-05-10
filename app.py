@@ -22,6 +22,7 @@ Run:
 
 from __future__ import annotations
 import argparse
+import json
 import math
 import os
 import socket
@@ -48,7 +49,7 @@ import torch.nn.functional as F
 from config import NanoLLMConfig, require_cuda
 from tokenizer import BPETokenizer
 from model import NanoLLM, _sample_from_logits
-from train import train_iter, save_loss_curve
+from train import train_iter, finetune_iter, save_loss_curve
 from forward_viz import (
     ForwardCapture, token_labels, _get_plt,
     slide_01_tokenization, slide_02_embeddings, slide_03_qkv,
@@ -76,6 +77,14 @@ _CONFIG: NanoLLMConfig | None = None
 _STATUS: str = ""  # Banner text shown in the header
 
 
+def _device_badge(device) -> str:
+    """Return an HTML-coloured device label for the status banner."""
+    label = str(device)
+    if label.startswith("cuda"):
+        return f'<span style="color:#4ade80;font-weight:bold">{label}</span>'
+    return f'<span style="color:#f87171;font-weight:bold">{label} ⚠ CPU — training will be slow</span>'
+
+
 def _load_model(checkpoint_path: str = "checkpoints/best.pt") -> None:
     """Load model + tokenizer once. Falls back to random weights if no checkpoint."""
     global _MODEL, _TOKENIZER, _CONFIG, _STATUS
@@ -101,7 +110,7 @@ def _load_model(checkpoint_path: str = "checkpoints/best.pt") -> None:
         val_loss = ckpt.get("val_loss", ckpt.get("loss", "?"))
         _STATUS = (
             f"**Loaded:** `{checkpoint_path}` (epoch {epoch}, val_loss={val_loss}) "
-            f"· **Device:** `{device}` · **Vocab:** {config.vocab_size} "
+            f"· **Device:** {_device_badge(device)} · **Vocab:** {config.vocab_size} "
             f"· **Params:** {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
         )
     else:
@@ -113,12 +122,13 @@ def _load_model(checkpoint_path: str = "checkpoints/best.pt") -> None:
         _STATUS = (
             f"⚠️ **No checkpoint at `{checkpoint_path}`** — using random weights. "
             f"Generation will be garbage. Run `bash run.sh train` first for real output. "
-            f"· **Device:** `{device}`"
+            f"· **Device:** {_device_badge(device)}"
         )
 
     _MODEL = model
     _TOKENIZER = tokenizer
     _CONFIG = config
+    _restore_train_state()
 
 
 def _require_loaded():
@@ -496,8 +506,64 @@ def run_bench(prompt, n_tokens):
 # Tab 5: Train (streams training progress into the UI)
 # ═══════════════════════════════════════════════════════════════
 
-# Module-level lock so we can't accidentally start two trainings at once.
-_TRAINING_LOCK = False
+# ── Background-training shared state ──────────────────────────
+# Training runs in a daemon thread so it survives tab switches and
+# browser refreshes. The UI polls _TRAIN_STATE every 2 s via gr.Timer.
+import threading as _threading
+
+_TRAIN_STATE: dict = {
+    "running": False,
+    "log_lines": [],
+    "plot_path": None,
+    "status": "idle",
+    "samples": "",
+    "train_history": [],
+    "epoch_history": [],
+}
+_TRAIN_LOCK = _threading.Lock()
+_TRAIN_STOP = _threading.Event()
+
+_TRAIN_STATE_PATH = os.path.join("checkpoints", "train_state.json")
+
+
+def _save_train_state() -> None:
+    """Persist log, history, samples, and status to disk (called after each epoch)."""
+    try:
+        os.makedirs("checkpoints", exist_ok=True)
+        with _TRAIN_LOCK:
+            payload = {
+                "status":        _TRAIN_STATE["status"],
+                "samples":       _TRAIN_STATE["samples"],
+                "log_lines":     _TRAIN_STATE["log_lines"][-500:],  # keep last 500 lines
+                "train_history": _TRAIN_STATE["train_history"],
+                "epoch_history": _TRAIN_STATE["epoch_history"],
+            }
+        with open(_TRAIN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass  # persistence is best-effort; never crash training
+
+
+def _restore_train_state() -> None:
+    """Load persisted training state on app startup if a saved run exists."""
+    if not os.path.exists(_TRAIN_STATE_PATH):
+        return
+    try:
+        with open(_TRAIN_STATE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        curve = os.path.join("checkpoints", "loss_curve.png")
+        with _TRAIN_LOCK:
+            _TRAIN_STATE.update({
+                "running":       False,
+                "status":        payload.get("status", "done"),
+                "samples":       payload.get("samples", ""),
+                "log_lines":     payload.get("log_lines", []),
+                "train_history": [tuple(x) for x in payload.get("train_history", [])],
+                "epoch_history": [tuple(x) for x in payload.get("epoch_history", [])],
+                "plot_path":     curve if os.path.exists(curve) else None,
+            })
+    except Exception:
+        pass
 
 
 def _build_live_curve(history: list[tuple[int, float]],
@@ -511,135 +577,381 @@ def _build_live_curve(history: list[tuple[int, float]],
     return path
 
 
-def train_stream(max_epochs_override: int, batch_size_override: int,
-                 learning_rate_override: float, dropout_override: float,
-                 warmup_steps_override: int,
-                 checkpoint_path: str = "checkpoints/best.pt"):
-    """Streaming training handler. Yields (log_text, plot_path, status, gen_samples).
+def _async_curve(history: list, epochs: list) -> None:
+    """Render loss curve in a daemon thread so training isn't blocked."""
+    path = _build_live_curve(history, epochs)
+    if path:
+        with _TRAIN_LOCK:
+            _TRAIN_STATE["plot_path"] = path
 
-    The Gradio UI updates all four outputs once per yielded frame. On completion
-    we reload the global _MODEL so the other tabs pick up the new checkpoint.
 
-    `warmup_steps_override=0` means "keep the config default and let auto-scale
-    run". Any non-zero value is treated as an explicit user choice and bypasses
-    auto-scale (same semantics as `--warmup-steps` on the CLI).
-    """
-    global _TRAINING_LOCK, _MODEL, _TOKENIZER, _CONFIG
+def _refresh_curve(history: list, epochs: list) -> None:
+    _threading.Thread(
+        target=_async_curve, args=(list(history), list(epochs)), daemon=True
+    ).start()
 
-    if _TRAINING_LOCK:
-        yield ("Training already in progress — wait for it to finish or restart the app.",
-               None, "busy", "")
-        return
 
-    _TRAINING_LOCK = True
-    log_lines: list[str] = []
-    train_history: list[tuple[int, float]] = []
-    epoch_history: list[tuple[int, float, float]] = []
-    samples_text = ""
-    last_plot_path = None
+def _train_bg(cfg: "NanoLLMConfig",
+              checkpoint_path: str = "checkpoints/best.pt") -> None:
+    """Background thread: runs train_iter and writes into _TRAIN_STATE."""
+    global _MODEL, _TOKENIZER, _CONFIG
+    step_counter = 0
+    _t0 = time.time()
 
-    def as_text():
-        # Tail to last 300 lines to keep the textbox responsive
-        tail = log_lines[-300:] if len(log_lines) > 300 else log_lines
-        return "\n".join(tail)
+    def _elapsed() -> str:
+        s = int(time.time() - _t0)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _log(msg: str) -> None:
+        with _TRAIN_LOCK:
+            _TRAIN_STATE["log_lines"].append(msg)
 
     try:
-        cfg = NanoLLMConfig()
-        cfg.max_epochs = int(max_epochs_override)
-        cfg.batch_size = int(batch_size_override)
-        cfg.learning_rate = float(learning_rate_override)
-        cfg.dropout = float(dropout_override)
-        if int(warmup_steps_override) > 0:
-            cfg.warmup_steps = int(warmup_steps_override)
-            setattr(cfg, "_warmup_explicit", True)
-
-        yield (f"Starting training  "
-               f"(epochs={cfg.max_epochs}  "
-               f"batch={cfg.batch_size}  "
-               f"lr={cfg.learning_rate:.0e}  "
-               f"dropout={cfg.dropout}  "
-               f"warmup={'auto' if not getattr(cfg, '_warmup_explicit', False) else cfg.warmup_steps})",
-               None, "running", "")
-
-        last_emit = time.time()
-        step_counter = 0
-
-        for evt in train_iter(cfg):
+        for evt in train_iter(cfg, stop_event=_TRAIN_STOP):
             t = evt["type"]
 
             if t == "log":
-                log_lines.append(evt["msg"])
+                _log(evt["msg"])
 
             elif t == "step":
                 step_counter += 1
-                train_history.append((evt["global_step"], evt["loss"]))
-                # Update the live loss curve every 10 steps
-                if step_counter % 10 == 0 and train_history:
-                    last_plot_path = _build_live_curve(train_history, epoch_history)
-                # Emit a log line only every log_interval steps (same cadence as CLI)
+                with _TRAIN_LOCK:
+                    _TRAIN_STATE["train_history"].append(
+                        (evt["global_step"], evt["loss"]))
+                    _hist_snap = list(_TRAIN_STATE["train_history"])
+                    _ep_snap   = list(_TRAIN_STATE["epoch_history"])
+                if step_counter % 10 == 0:
+                    _refresh_curve(_hist_snap, _ep_snap)
                 if evt["batch_idx"] % cfg.log_interval == 0:
-                    ppl = math.exp(min(evt["loss"], 20)) if evt["loss"] < 20 else float("inf")
-                    log_lines.append(
-                        f"  Epoch {evt['epoch']}/{cfg.max_epochs} | "
-                        f"Step {evt['batch_idx']}/{evt['total_batches']} | "
-                        f"Loss {evt['loss']:.4f} | PPL {ppl:.1f} | "
-                        f"LR {evt['lr']:.2e} | {evt['tps']:,.0f} tok/s"
-                    )
+                    ppl = (math.exp(min(evt["loss"], 20))
+                           if evt["loss"] < 20 else float("inf"))
+                    st = evt.get("step_time", 0)
+                    _log(f"  [{_elapsed()}] Epoch {evt['epoch']}/{cfg.max_epochs} | "
+                         f"Step {evt['batch_idx']}/{evt['total_batches']} | "
+                         f"Loss {evt['loss']:.4f} | PPL {ppl:.1f} | "
+                         f"LR {evt['lr']:.2e} | {evt['tps']:,.0f} tok/s | {st:.1f}s/step")
 
             elif t == "epoch":
-                epoch_history.append((evt["epoch"], evt["train_loss"], evt["val_loss"]))
-                log_lines.append("")
-                log_lines.append(
-                    f"  Epoch {evt['epoch']}/{evt['max_epochs']} done  |  "
-                    f"train={evt['train_loss']:.4f}  val={evt['val_loss']:.4f}  "
-                    f"(train_ppl={evt['train_ppl']:.1f}  val_ppl={evt['val_ppl']:.1f})  "
-                    f"time={evt['elapsed']:.1f}s"
-                )
+                with _TRAIN_LOCK:
+                    _TRAIN_STATE["epoch_history"].append(
+                        (evt["epoch"], evt["train_loss"], evt["val_loss"]))
+                    _hist_snap = list(_TRAIN_STATE["train_history"])
+                    _ep_snap   = list(_TRAIN_STATE["epoch_history"])
+                mins, secs = divmod(int(evt["elapsed"]), 60)
+                _log("")
+                _log(f"  Epoch {evt['epoch']}/{evt['max_epochs']} done  |  "
+                     f"train={evt['train_loss']:.4f}  val={evt['val_loss']:.4f}  "
+                     f"(ppl {evt['train_ppl']:.1f} / {evt['val_ppl']:.1f})  "
+                     f"epoch time={mins}m{secs:02d}s")
                 if evt["samples"]:
                     preview = evt["samples"][0].replace("\n", " / ")[:200]
-                    samples_text = (f"Epoch {evt['epoch']} generation sample:\n"
-                                    f"  \"{preview}\"")
-                # Re-render loss curve now that we have new epoch data
-                last_plot_path = _build_live_curve(train_history, epoch_history)
+                    new_entry = f"Epoch {evt['epoch']} sample:\n  \"{preview}\""
+                    with _TRAIN_LOCK:
+                        existing = _TRAIN_STATE["samples"]
+                        _TRAIN_STATE["samples"] = (
+                            new_entry if not existing
+                            else new_entry + "\n\n" + existing)
+                _refresh_curve(_hist_snap, _ep_snap)
+                _threading.Thread(target=_save_train_state, daemon=True).start()
 
             elif t == "best":
-                log_lines.append(f"  * New best val loss {evt['val_loss']:.4f} "
-                                 f"saved to {evt['path']}")
+                _log(f"  * New best val loss {evt['val_loss']:.4f} -> {evt['path']}")
 
             elif t == "done":
-                log_lines.append("")
-                log_lines.append("=" * 50)
-                log_lines.append(f"Training complete.  Best val loss: {evt['best_val_loss']:.4f}")
-                log_lines.append(f"Loss curve: {evt['curve_path']}")
-                log_lines.append("=" * 50)
-                last_plot_path = evt["curve_path"] or last_plot_path
+                _log("")
+                _log("=" * 50)
+                _log(f"Training complete.  Best val loss: {evt['best_val_loss']:.4f}")
+                _log(f"Loss curve: {evt['curve_path']}")
+                _log("=" * 50)
+                with _TRAIN_LOCK:
+                    if evt["curve_path"]:
+                        _TRAIN_STATE["plot_path"] = evt["curve_path"]
 
-            elif t == "error":
-                log_lines.append(f"ERROR: {evt['msg']}")
-                yield (as_text(), last_plot_path, "error", samples_text)
+            elif t == "stopped":
+                _log("Training stopped by user.")
+                with _TRAIN_LOCK:
+                    _TRAIN_STATE["status"] = "stopped"
+                _save_train_state()
                 return
 
-            # Throttle UI updates — flush immediately for infrequent events
-            # (log, epoch, best, done, error) but rate-limit high-frequency
-            # step events to every 0.5s so we don't choke the SSE stream.
-            now = time.time()
-            if (t in ("log", "epoch", "best", "done", "error")
-                or now - last_emit >= 0.5):
-                yield (as_text(), last_plot_path, "running", samples_text)
-                last_emit = now
+            elif t == "error":
+                _log(f"ERROR: {evt['msg']}")
+                with _TRAIN_LOCK:
+                    _TRAIN_STATE["status"] = "error"
+                    _TRAIN_STATE["running"] = False
+                return
 
-        # Training finished — reload the singleton so other tabs see the new model
         try:
             _load_model(checkpoint_path)
-            log_lines.append("")
-            log_lines.append(f"Model reloaded.  Status: {_STATUS}")
-        except Exception as e:
-            log_lines.append(f"  (note: couldn't auto-reload model: {e})")
+            _log(f"Model reloaded.  Status: {_STATUS}")
+        except Exception as exc:
+            _log(f"  (note: couldn't auto-reload model: {exc})")
 
-        yield (as_text(), last_plot_path, "done", samples_text)
+        with _TRAIN_LOCK:
+            _TRAIN_STATE["status"] = "done"
+        _save_train_state()
 
+    except Exception as exc:
+        _log(f"FATAL: {exc}")
+        with _TRAIN_LOCK:
+            _TRAIN_STATE["status"] = "error"
     finally:
-        _TRAINING_LOCK = False
+        with _TRAIN_LOCK:
+            _TRAIN_STATE["running"] = False
+
+
+def train_start(max_epochs_override: int, batch_size_override: int,
+                learning_rate_override: float, dropout_override: float,
+                warmup_steps_override: int,
+                checkpoint_path: str = "checkpoints/best.pt") -> str:
+    """Launch training in a background thread; return immediately."""
+    with _TRAIN_LOCK:
+        if _TRAIN_STATE["running"]:
+            return "already running"
+        _TRAIN_STOP.clear()
+        _TRAIN_STATE.update({
+            "running": True,
+            "log_lines": [],
+            "plot_path": None,
+            "status": "running",
+            "samples": "",
+            "train_history": [],
+            "epoch_history": [],
+        })
+
+    cfg = NanoLLMConfig()
+    cfg.max_epochs = int(max_epochs_override)
+    cfg.batch_size = int(batch_size_override)
+    cfg.learning_rate = float(learning_rate_override)
+    cfg.dropout = float(dropout_override)
+    if int(warmup_steps_override) > 0:
+        cfg.warmup_steps = int(warmup_steps_override)
+        setattr(cfg, "_warmup_explicit", True)
+
+    _threading.Thread(
+        target=_train_bg, args=(cfg, checkpoint_path), daemon=True
+    ).start()
+    return "running"
+
+
+def poll_train() -> tuple:
+    """Called by gr.Timer every 2 s — returns latest training state."""
+    with _TRAIN_LOCK:
+        tail = _TRAIN_STATE["log_lines"][-300:]
+        log = "\n".join(tail)
+        plot = _TRAIN_STATE["plot_path"]
+        status = _TRAIN_STATE["status"]
+        samples = _TRAIN_STATE["samples"] or "(samples appear here after each epoch completes)"
+    return log, plot, status, samples
+
+
+def train_stop() -> str:
+    """Signal the background training thread to stop after the current batch."""
+    _TRAIN_STOP.set()
+    return "stopping…"
+
+
+def train_restart(max_epochs_override: int, batch_size_override: int,
+                  learning_rate_override: float, dropout_override: float,
+                  warmup_steps_override: int,
+                  checkpoint_path: str = "checkpoints/best.pt") -> str:
+    """Stop any running training then immediately start a fresh run."""
+    _TRAIN_STOP.set()
+    # Brief spin-wait (max 3 s) for the thread to notice and exit
+    for _ in range(30):
+        with _TRAIN_LOCK:
+            if not _TRAIN_STATE["running"]:
+                break
+        _threading.Event().wait(0.1)
+    return train_start(max_epochs_override, batch_size_override,
+                       learning_rate_override, dropout_override,
+                       warmup_steps_override, checkpoint_path)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Fine-tune tab: adapt the pre-trained model on custom text
+# ═══════════════════════════════════════════════════════════════
+
+_FT_STATE: dict = {
+    "running": False,
+    "log_lines": [],
+    "plot_path": None,
+    "status": "idle",
+    "samples": "",
+    "train_history": [],
+    "epoch_history": [],
+}
+_FT_LOCK = _threading.Lock()
+_FT_STOP = _threading.Event()
+
+
+def _ft_bg(custom_text: str, checkpoint_path: str,
+           learning_rate: float, max_epochs: int,
+           batch_size: int) -> None:
+    """Background thread: runs finetune_iter and writes into _FT_STATE."""
+    global _MODEL, _TOKENIZER, _CONFIG
+    step_counter = 0
+    _t0 = time.time()
+
+    def _elapsed() -> str:
+        s = int(time.time() - _t0)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _log(msg: str) -> None:
+        with _FT_LOCK:
+            _FT_STATE["log_lines"].append(msg)
+
+    try:
+        ft_cfg = NanoLLMConfig()
+        ft_cfg.learning_rate = learning_rate
+        ft_cfg.max_epochs = max_epochs
+        ft_cfg.batch_size = batch_size
+
+        for evt in finetune_iter(
+            custom_text,
+            checkpoint_path=checkpoint_path,
+            config=ft_cfg,
+            stop_event=_FT_STOP,
+        ):
+            t = evt["type"]
+
+            if t == "log":
+                _log(evt["msg"])
+
+            elif t == "step":
+                step_counter += 1
+                with _FT_LOCK:
+                    _FT_STATE["train_history"].append(
+                        (evt["global_step"], evt["loss"]))
+                    _hist_snap = list(_FT_STATE["train_history"])
+                    _ep_snap   = list(_FT_STATE["epoch_history"])
+                if step_counter % 10 == 0:
+                    path = _build_live_curve(_hist_snap, _ep_snap)
+                    if path:
+                        with _FT_LOCK:
+                            _FT_STATE["plot_path"] = path
+                if evt["batch_idx"] % 5 == 0:
+                    ppl = (math.exp(min(evt["loss"], 20))
+                           if evt["loss"] < 20 else float("inf"))
+                    _log(f"  [{_elapsed()}] Epoch {evt['epoch']}/{max_epochs} | "
+                         f"Step {evt['batch_idx']}/{evt['total_batches']} | "
+                         f"Loss {evt['loss']:.4f} | PPL {ppl:.1f} | "
+                         f"LR {evt['lr']:.2e} | {evt['tps']:,.0f} tok/s")
+
+            elif t == "epoch":
+                with _FT_LOCK:
+                    _FT_STATE["epoch_history"].append(
+                        (evt["epoch"], evt["train_loss"], evt["val_loss"]))
+                    _hist_snap = list(_FT_STATE["train_history"])
+                    _ep_snap   = list(_FT_STATE["epoch_history"])
+                mins, secs = divmod(int(evt["elapsed"]), 60)
+                _log("")
+                _log(f"  Epoch {evt['epoch']}/{evt['max_epochs']} done  |  "
+                     f"train={evt['train_loss']:.4f}  val={evt['val_loss']:.4f}  "
+                     f"(ppl {evt['train_ppl']:.1f} / {evt['val_ppl']:.1f})  "
+                     f"epoch time={mins}m{secs:02d}s")
+                if evt["samples"]:
+                    preview = evt["samples"][0].replace("\n", " / ")[:200]
+                    new_entry = f"Epoch {evt['epoch']} sample:\n  \"{preview}\""
+                    with _FT_LOCK:
+                        existing = _FT_STATE["samples"]
+                        _FT_STATE["samples"] = (
+                            new_entry if not existing
+                            else new_entry + "\n\n" + existing)
+                path = _build_live_curve(_hist_snap, _ep_snap)
+                if path:
+                    with _FT_LOCK:
+                        _FT_STATE["plot_path"] = path
+
+            elif t == "best":
+                _log(f"  * New best val loss {evt['val_loss']:.4f} -> {evt['path']}")
+
+            elif t == "done":
+                _log("")
+                _log("=" * 50)
+                _log(f"Fine-tuning complete.  Best val loss: {evt['best_val_loss']:.4f}")
+                _log(f"Saved: {evt.get('curve_path', 'checkpoints/finetuned.pt')}")
+                _log("=" * 50)
+                with _FT_LOCK:
+                    if evt.get("curve_path"):
+                        _FT_STATE["plot_path"] = evt["curve_path"]
+
+            elif t == "stopped":
+                _log("Fine-tuning stopped by user.")
+                with _FT_LOCK:
+                    _FT_STATE["status"] = "stopped"
+                return
+
+            elif t == "error":
+                _log(f"ERROR: {evt['msg']}")
+                with _FT_LOCK:
+                    _FT_STATE["status"] = "error"
+                    _FT_STATE["running"] = False
+                return
+
+        # Reload the fine-tuned model so Generate tab uses updated weights
+        try:
+            ft_path = "checkpoints/finetuned.pt"
+            if os.path.exists(ft_path):
+                _load_model(ft_path)
+                _log(f"Fine-tuned model reloaded from {ft_path}")
+        except Exception as exc:
+            _log(f"  (note: couldn't auto-reload fine-tuned model: {exc})")
+
+        with _FT_LOCK:
+            _FT_STATE["status"] = "done"
+
+    except Exception as exc:
+        _log(f"FATAL: {exc}")
+        with _FT_LOCK:
+            _FT_STATE["status"] = "error"
+    finally:
+        with _FT_LOCK:
+            _FT_STATE["running"] = False
+
+
+def ft_start(custom_text: str, checkpoint_path: str,
+             learning_rate: float, max_epochs: int,
+             batch_size: int) -> str:
+    """Launch fine-tuning in a background thread; return immediately."""
+    if not custom_text or len(custom_text.strip()) < 200:
+        return "error: paste at least 200 characters of text to fine-tune on"
+    with _FT_LOCK:
+        if _FT_STATE["running"]:
+            return "already running"
+        _FT_STOP.clear()
+        _FT_STATE.update({
+            "running": True,
+            "log_lines": [],
+            "plot_path": None,
+            "status": "running",
+            "samples": "",
+            "train_history": [],
+            "epoch_history": [],
+        })
+    _threading.Thread(
+        target=_ft_bg,
+        args=(custom_text, checkpoint_path, learning_rate, int(max_epochs), int(batch_size)),
+        daemon=True,
+    ).start()
+    return "running"
+
+
+def ft_stop() -> str:
+    """Signal the fine-tuning thread to stop after the current batch."""
+    _FT_STOP.set()
+    return "stopping…"
+
+
+def poll_ft() -> tuple:
+    """Called by gr.Timer every 2 s — returns latest fine-tune state."""
+    with _FT_LOCK:
+        tail = _FT_STATE["log_lines"][-300:]
+        log = "\n".join(tail)
+        plot = _FT_STATE["plot_path"]
+        status = _FT_STATE["status"]
+        samples = _FT_STATE["samples"] or "(samples appear here after each epoch completes)"
+    return log, plot, status, samples
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1040,7 +1352,7 @@ def run_dataset(text: str, seq_len: int, stride: int, sample_idx: int):
 
 
 def run_component(name: str):
-    """Render the (text, figure) pair for one Components sub-tab."""
+    """Render the (text, figure) pair for one TransformerBlock sub-tab."""
     _, _, config = _require_loaded()
     if name == "rmsnorm":
         return nv.rmsnorm_summary(config), _save_fig(
@@ -1094,20 +1406,47 @@ def build_ui() -> gr.Blocks:
     n_heads = _CONFIG.n_heads if _CONFIG is not None else 6
     max_seq = _CONFIG.max_seq_len if _CONFIG is not None else 256
 
+    _css = "#sidebar-nav .wrap { display: flex !important; flex-direction: column !important; gap: 4px !important; }"
     with gr.Blocks(title="LLM101 - Console",
-                   theme=gr.themes.Soft(primary_hue="blue")) as demo:
+                   theme=gr.themes.Soft(primary_hue="blue"),
+                   css=_css) as demo:
         gr.Markdown(
             "# LLM101 - Console\n"
-            "A ~15M-parameter GPT-style transformer, built from scratch. "
-            "Tabs mirror the notebook: **Tokenizer** (§2) · **Dataset** (§3) · "
-            "**Components** (§4) · **Train** (§6) · **Train Reports** (§5) · "
-            "**Attention** / **Visualize** (§8) · **Generate** (§7) · "
-            "**Benchmark** + **KV Cache** (§9)."
+            "A ~15M-parameter GPT-style decoder-only transformer, built from scratch in PyTorch. "
+            "📓 [Open in JupyterLab](http://127.0.0.1:8888/lab/tree/LLM101_From_Scratch.ipynb) "
+            "— run `bash run.sh notebook` in a terminal first to start the server.\n\n"
+            "- **Tokenizer** (§2) — BPE vocabulary: how raw text is split into tokens\n"
+            "- **Dataset** (§3) — Sliding-window sampling: input/target pairs for training\n"
+            "- **TransformerBlock** (§4) — Block anatomy: RMSNorm · RoPE · Causal Attention · SwiGLU FFN\n"
+            "- **Train** (§6) — Live training: adjust hyperparameters, watch loss fall in real time\n"
+            "- **Fine-tune** — Adapt the pre-trained model on your own text at a lower learning rate\n"
+            "- **Train Reports** (§5) — 16-slide forward-pass walkthrough: every tensor transformation visualised\n"
+            "- **Attention** (§8) — Per-head heatmap + attention rollout for any prompt\n"
+            "- **Visualize** (§8) — Animated 3-panel view: hidden states, norms, and attention across layers\n"
+            "- **Generate** (§7) — Token-by-token generation with temperature / top-k / top-p controls\n"
+            "- **Benchmark** (§9) — Throughput: `generate()` (no cache) vs `generate_fast()` (KV cache)\n"
+            "- **KV Cache** (§9) — Correctness tests: single-step, multi-step equivalence, length-sweep timing\n"
+            "- **Architecture** — Interactive Mermaid flowchart of the full end-to-end pipeline"
         )
         gr.Markdown(_STATUS)
 
-        # ── Tab 1: Build Steps (orientation — how the project is structured) ──
-        with gr.Tab("Build Steps", visible=False):
+        _NAV_CHOICES = [
+            "Tokenizer", "Dataset", "TransformerBlock", "Train",
+            "Fine-tune", "Train Reports", "Attention", "Visualize", "Generate",
+            "Benchmark", "KV Cache", "Architecture",
+        ]
+
+        with gr.Sidebar(open=True):
+            gr.Markdown("### LLM101")
+            _nav = gr.Radio(
+                choices=_NAV_CHOICES,
+                value="Tokenizer",
+                label="",
+                elem_id="sidebar-nav",
+            )
+
+        # ── hidden legacy panels (not in nav) ──
+        with gr.Column(visible=False):
             gr.Markdown(
                 "A 12-step tour of how this project was actually built, in the order "
                 "a new builder should follow. Complements the standalone `BUILDING.md` "
@@ -1174,8 +1513,8 @@ def build_ui() -> gr.Blocks:
                 outputs=[build_md, build_img],
             )
 
-        # ── Notebook tab: Tokenizer (notebook §2) ──
-        with gr.Tab("Tokenizer"):
+        # ── Panel: Tokenizer ──
+        with gr.Column(visible=True) as _panel_tokenizer:
             gr.Markdown(
                 "### Byte-level BPE — see exactly how text becomes tokens\n\n"
                 "Mirrors **§2** of `LLM101_From_Scratch.ipynb`. Type any text "
@@ -1197,8 +1536,20 @@ def build_ui() -> gr.Blocks:
                     )
                 with gr.Column(scale=1):
                     tok_overview = gr.Image(
-                        label="Vocabulary composition + compression",
+                        label="Vocabulary breakdown + compression",
                         type="filepath",
+                    )
+                    gr.Markdown(
+                        "**Left:** The vocabulary has 3 tiers — 4 special control tokens "
+                        "(PAD/BOS/EOS/UNK), 256 byte-level fallback tokens that can encode "
+                        "*any* Unicode character losslessly, and the bulk: BPE merge tokens "
+                        "learned from the corpus that represent common byte sequences as a "
+                        "single unit.\n\n"
+                        "**Right:** Compression ratio = bytes in the original text ÷ number "
+                        "of tokens produced. A ratio of 4× means 4 bytes were packed into "
+                        "1 token. The red dashed line at 1.0 is the no-compression baseline "
+                        "(one token per byte). Richer, repetitive text compresses better "
+                        "because BPE has seen those patterns during training."
                     )
             tok_btn.click(run_tokenizer,
                           inputs=[tok_in],
@@ -1206,8 +1557,7 @@ def build_ui() -> gr.Blocks:
             demo.load(run_tokenizer, inputs=[tok_in],
                       outputs=[tok_breakdown, tok_overview])
 
-        # ── Notebook tab: Dataset (notebook §3) ──
-        with gr.Tab("Dataset"):
+        with gr.Column(visible=False) as _panel_dataset:
             gr.Markdown(
                 "### Sliding-window dataset — input vs target shift, window overlap\n\n"
                 "Mirrors **§3** of the notebook. The corpus is encoded once, "
@@ -1232,7 +1582,6 @@ def build_ui() -> gr.Blocks:
                     ds_stride = gr.Slider(
                         1, max_seq, value=min(16, max_seq), step=1,
                         label="stride (offset between windows)",
-                        info="stride = seq_len/2 by default, giving 50% overlap.",
                     )
                     ds_idx = gr.Slider(
                         0, 8, value=0, step=1,
@@ -1242,6 +1591,16 @@ def build_ui() -> gr.Blocks:
                     ds_status = gr.Markdown()
                 with gr.Column(scale=2):
                     ds_img = gr.Image(label="Shift + windows", type="filepath")
+                    gr.Markdown(
+                        "<small>"
+                        "**seq_len** — how many tokens the model sees at once (its context window). "
+                        "Larger values give richer context but consume more GPU memory and require longer sequences in the training data.<br>"
+                        "**stride** — how far the window slides between consecutive samples. "
+                        "stride &lt; seq_len creates overlap so tokens near a boundary appear in multiple training windows, seen in different contexts.<br>"
+                        "**sample index** — selects which overlapping window to display in the top panel. "
+                        "Increasing by 1 shifts the highlighted window right by <code>stride</code> tokens — visible in the Gantt chart above."
+                        "</small>"
+                    )
             ds_btn.click(run_dataset,
                          inputs=[ds_text, ds_seq, ds_stride, ds_idx],
                          outputs=[ds_img, ds_status])
@@ -1249,8 +1608,28 @@ def build_ui() -> gr.Blocks:
                       inputs=[ds_text, ds_seq, ds_stride, ds_idx],
                       outputs=[ds_img, ds_status])
 
-        # ── Notebook tab: Components (notebook §4a–d) ──
-        with gr.Tab("Components"):
+            with gr.Accordion("data/corpus.txt — preview", open=False):
+                corpus_stats = gr.Markdown()
+                corpus_preview = gr.Textbox(
+                    label="First 3 000 characters",
+                    lines=16, max_lines=16,
+                    interactive=False, show_copy_button=True,
+                )
+                def _load_corpus():
+                    path = "data/corpus.txt"
+                    if not os.path.exists(path):
+                        return "_corpus not found — run `bash run.sh setup` first_", ""
+                    size = os.path.getsize(path)
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    lines = text.count("\n")
+                    preview = text[:3000] + ("\n…" if len(text) > 3000 else "")
+                    stats = (f"**{path}** · {size:,} bytes · {len(text):,} chars "
+                             f"· {lines:,} lines · {len(text.split()):,} words")
+                    return stats, preview
+                demo.load(_load_corpus, inputs=None, outputs=[corpus_stats, corpus_preview])
+
+        with gr.Column(visible=False) as _panel_tb:
             gr.Markdown(
                 "### Atomic components — RMSNorm · RoPE · Attention · SwiGLU\n\n"
                 "Mirrors **§4** of the notebook. Each sub-tab instantiates "
@@ -1259,60 +1638,104 @@ def build_ui() -> gr.Blocks:
                 "TransformerBlock. Numbers update if you re-train with a "
                 "different config."
             )
-            with gr.Tab("RMSNorm"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        rms_txt = gr.Code(label="Summary", language=None,
-                                          interactive=False)
-                    with gr.Column(scale=1):
-                        rms_img = gr.Image(
-                            label="Activation distribution before / after",
-                            type="filepath",
-                        )
-                demo.load(lambda: run_component("rmsnorm"),
-                          inputs=None, outputs=[rms_txt, rms_img])
+            with gr.Row():
+                # ── Left column: architecture diagram ──
+                with gr.Column(scale=1):
+                    gr.Image(
+                        value=_save_fig(nv.draw_transformer_block_diagram(), "comp_diagram"),
+                        label="TransformerBlock — how the components connect",
+                        type="filepath", show_download_button=False,
+                        height=800,
+                    )
 
-            with gr.Tab("RoPE"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        rope_txt = gr.Code(label="Summary", language=None,
-                                           interactive=False)
-                    with gr.Column(scale=2):
-                        rope_img = gr.Image(
-                            label="cos / sin tables + unit-vector rotation",
-                            type="filepath",
-                        )
-                demo.load(lambda: run_component("rope"),
-                          inputs=None, outputs=[rope_txt, rope_img])
+                # ── Right column: component detail tabs ──
+                with gr.Column(scale=1):
+                    with gr.Tabs():
+                        with gr.Tab("RMSNorm"):
+                            rms_txt = gr.Code(label="Summary", language=None,
+                                              interactive=False, lines=18, max_lines=18)
+                            gr.Markdown(
+                                "<small><b>Summary:</b> RMSNorm rescales each activation vector so its root-mean-square equals 1, "
+                                "then multiplies by a learnable per-dimension weight γ. Unlike LayerNorm it skips the mean-subtraction step, "
+                                "saving 384 parameters per layer (50% reduction) with no measurable quality loss.</small>"
+                            )
+                            gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:6px 0'>")
+                            gr.Markdown(
+                                "<small><b>Chart:</b> The blue histogram (Before) is wide and off-centre — raw activations can grow large and destabilise gradients. "
+                                "The green histogram (After) is tightly concentrated around 0 with std ≈ 1, giving the next layer consistent input scale regardless of sequence content.</small>"
+                            )
+                            rms_img = gr.Image(
+                                label="Activation distribution before / after",
+                                type="filepath", height=280,
+                            )
 
-            with gr.Tab("Attention"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        cmask_txt = gr.Code(label="Summary", language=None,
-                                            interactive=False)
-                    with gr.Column(scale=1):
-                        cmask_img = gr.Image(
-                            label="Causal mask (1 = visible, 0 = masked)",
-                            type="filepath",
-                        )
-                demo.load(lambda: run_component("attention"),
-                          inputs=None, outputs=[cmask_txt, cmask_img])
+                        with gr.Tab("RoPE"):
+                            rope_txt = gr.Code(label="Summary", language=None,
+                                               interactive=False, lines=18, max_lines=18)
+                            gr.Markdown(
+                                "<small><b>Summary:</b> RoPE encodes position by rotating each query/key vector in 2D planes using sine and cosine functions of the position index. "
+                                "The rotation angle grows with frequency index, so nearby tokens share similar angles while distant tokens diverge — "
+                                "this makes attention scores naturally decay with distance without any learned positional embedding table.</small>"
+                            )
+                            gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:6px 0'>")
+                            gr.Markdown(
+                                "<small><b>Chart:</b> Left two panels show the cos and sin frequency tables across positions (rows) and dimension pairs (columns) — "
+                                "each column oscillates at a different frequency. The right panel shows how a single token's vector rotates as its position increases; "
+                                "the coloured arrows trace the unit circle, one arrow per position.</small>"
+                            )
+                            rope_img = gr.Image(
+                                label="cos / sin tables + unit-vector rotation",
+                                type="filepath", height=280,
+                            )
 
-            with gr.Tab("SwiGLU"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        sw_txt = gr.Code(label="Summary", language=None,
-                                         interactive=False)
-                    with gr.Column(scale=1):
-                        sw_img = gr.Image(
-                            label="Parameter breakdown across 3 projections",
-                            type="filepath",
-                        )
-                demo.load(lambda: run_component("swiglu"),
-                          inputs=None, outputs=[sw_txt, sw_img])
+                        with gr.Tab("Attention"):
+                            cmask_txt = gr.Code(label="Summary", language=None,
+                                                interactive=False, lines=18, max_lines=18)
+                            gr.Markdown(
+                                "<small><b>Summary:</b> The causal mask enforces the autoregressive constraint: position i may only attend to positions ≤ i. "
+                                "It is implemented as an upper-triangular matrix of −∞ values added to the raw attention scores before softmax, "
+                                "driving those weights to zero so future tokens contribute nothing to the current prediction.</small>"
+                            )
+                            gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:6px 0'>")
+                            gr.Markdown(
+                                "<small><b>Chart:</b> Dark cells (1 = visible) form the lower triangle including the diagonal — a token always attends to itself and all earlier tokens. "
+                                "White cells (0 = masked) are the future positions that get −∞ before softmax. "
+                                "The strict triangular shape is why the model can be trained on all positions in parallel yet still learns left-to-right generation.</small>"
+                            )
+                            cmask_img = gr.Image(
+                                label="Causal mask (1 = visible, 0 = masked)",
+                                type="filepath", height=280,
+                            )
 
-        # ── Tab 2: Train (train the model) ──
-        with gr.Tab("Train"):
+                        with gr.Tab("SwiGLU"):
+                            sw_txt = gr.Code(label="Summary", language=None,
+                                             interactive=False, lines=18, max_lines=18)
+                            gr.Markdown(
+                                "<small><b>Summary:</b> SwiGLU splits the FFN expansion into two parallel projections (gate and value). "
+                                "The gate branch passes through Swish (x·σ(x)), producing a smooth gating signal that multiplies element-wise with the value branch — "
+                                "selectively suppressing or amplifying each hidden dimension before the final down-projection. "
+                                "This gives the network a multiplicative interaction that ReLU FFNs lack, improving expressiveness for the same parameter count.</small>"
+                            )
+                            gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:6px 0'>")
+                            gr.Markdown(
+                                "<small><b>Chart:</b> The three bars show the parameter count of each linear layer: gate_proj, up_proj (both d_model → d_ff), and down_proj (d_ff → d_model). "
+                                "All three are the same size; together they account for roughly half the model's total parameters.</small>"
+                            )
+                            sw_img = gr.Image(
+                                label="Parameter breakdown across 3 projections",
+                                type="filepath", height=280,
+                            )
+
+            demo.load(lambda: run_component("rmsnorm"),
+                      inputs=None, outputs=[rms_txt, rms_img])
+            demo.load(lambda: run_component("rope"),
+                      inputs=None, outputs=[rope_txt, rope_img])
+            demo.load(lambda: run_component("attention"),
+                      inputs=None, outputs=[cmask_txt, cmask_img])
+            demo.load(lambda: run_component("swiglu"),
+                      inputs=None, outputs=[sw_txt, sw_img])
+
+        with gr.Column(visible=False) as _panel_train:
             gr.Markdown(
                 "**Trigger training from the UI and watch progress live.** "
                 "Training writes `checkpoints/best.pt` and `checkpoints/loss_curve.png`. "
@@ -1321,55 +1744,198 @@ def build_ui() -> gr.Blocks:
                 "Needs `data/corpus.txt` (run `bash run.sh setup` first)."
             )
             with gr.Row():
+                # ── Left: controls ──
                 with gr.Column(scale=1, min_width=280):
                     train_epochs = gr.Slider(
                         1, 30, value=10, step=1, label="max_epochs",
-                        info="How many full passes through the dataset. Too few = underfit, too many = overfit. Watch the val_loss to find the sweet spot.",
                     )
                     train_batch = gr.Slider(
                         8, 128, value=64, step=8, label="batch_size",
-                        info="Sequences processed in parallel per step. Larger = smoother gradients but more memory. Lower (8-16) if you hit OOM.",
                     )
                     train_lr = gr.Slider(
                         1e-5, 1e-3, value=3e-4, step=1e-5, label="learning_rate",
-                        info="Peak learning rate after warmup. Controls step size during gradient descent. Too high = unstable, too low = slow convergence. 3e-4 is the AdamW standard.",
                     )
                     train_dropout = gr.Slider(
                         0.0, 0.4, value=0.1, step=0.05, label="dropout",
-                        info="Randomly zeroes this fraction of activations during training. Regularization that prevents overfitting — the model can't rely on any single neuron.",
                     )
                     train_warmup = gr.Slider(
                         0, 500, value=0, step=10, label="warmup_steps",
-                        info="Steps where LR ramps from 0 to peak before cosine decay. Prevents early gradient explosion. 0 = auto-scale to 10% of total steps.",
                     )
-                    train_btn = gr.Button("Start training", variant="primary", size="lg")
-                    train_status = gr.Textbox(
-                        label="Status", value="idle", interactive=False,
+                    with gr.Row():
+                        train_btn  = gr.Button("Start",   variant="primary",   scale=2)
+                        train_stop_btn    = gr.Button("Stop",    variant="stop",      scale=1)
+                        train_restart_btn = gr.Button("Restart", variant="secondary", scale=1)
+                    gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:8px 0'>")
+                    gr.Markdown(
+                        "<small>"
+                        "**max_epochs** — Full passes through the dataset. Too few = underfit, too many = overfit; watch val_loss to find the sweet spot.<br><br>"
+                        "**batch_size** — Sequences processed in parallel per step. Larger = smoother gradients but more memory; lower (8–16) if you hit OOM.<br><br>"
+                        "**learning_rate** — Peak LR after warmup. Too high = unstable, too low = slow convergence; 3e-4 is the AdamW standard.<br><br>"
+                        "**dropout** — Fraction of activations zeroed during training. Regularisation that prevents overfitting — the model can't rely on any single neuron.<br><br>"
+                        "**warmup_steps** — Steps where LR ramps from 0 to peak before cosine decay. Prevents early gradient explosion; 0 = auto-scale to 10% of total steps."
+                        "</small>"
                     )
-                    train_samples = gr.Textbox(
-                        label="Latest generation sample",
-                        lines=4, interactive=False,
-                    )
+                # ── Right: outputs ──
                 with gr.Column(scale=2):
                     train_log = gr.Textbox(
                         label="Training log (streaming)",
                         value="(press Start to begin)",
-                        lines=22, max_lines=30, show_copy_button=True,
+                        lines=14, max_lines=20, show_copy_button=True,
                         interactive=False,
                     )
                     train_plot = gr.Image(
-                        label="Loss curve (live)", type="filepath", height=340,
+                        label="Loss curve (live)", type="filepath", height=300,
+                    )
+                    gr.Markdown(
+                        "<small>Blue = training loss (per step), orange = validation loss (per epoch). "
+                        "Both should fall over time. A rising val loss while train loss keeps falling = overfitting. "
+                        "The gap between them shows how well the model generalises beyond the training data.</small>"
+                    )
+                    train_status = gr.Textbox(
+                        label="Status", value="idle", interactive=False,
+                    )
+                    gr.Markdown(
+                        "<small><b>idle</b> — no run yet · <b>running</b> — training in background (safe to switch tabs) · "
+                        "<b>done</b> — finished, model reloaded · <b>error</b> — check log above.</small>"
+                    )
+                    train_samples = gr.Textbox(
+                        label="Generation samples (newest first)",
+                        value="(samples appear here after each epoch completes)",
+                        lines=8, max_lines=20, interactive=False,
+                    )
+                    gr.Markdown(
+                        "<small>After each epoch the model generates from a fixed prompt — newest epoch on top. "
+                        "Early epochs produce random-looking text; by epoch 3–5 you should see coherent words and simple sentences. "
+                        "Scroll down to compare earlier epochs and track how fluency improves over time.</small>"
                     )
 
+            _train_inputs = [train_epochs, train_batch, train_lr,
+                             train_dropout, train_warmup]
             train_btn.click(
-                train_stream,
-                inputs=[train_epochs, train_batch, train_lr,
-                        train_dropout, train_warmup],
-                outputs=[train_log, train_plot, train_status, train_samples],
+                train_start, inputs=_train_inputs, outputs=[train_status],
             )
+            train_stop_btn.click(
+                train_stop, inputs=[], outputs=[train_status],
+            )
+            train_restart_btn.click(
+                train_restart, inputs=_train_inputs, outputs=[train_status],
+            )
+            # Poll training state every 2 s — works even when tab is not visible
+            train_timer = gr.Timer(value=2)
+            train_timer.tick(poll_train,
+                             outputs=[train_log, train_plot, train_status, train_samples])
 
-        # ── Tab 3: Effects (hyperparameter reference) ──
-        with gr.Tab("Effects", visible=False):
+        with gr.Column(visible=False) as _panel_finetune:
+            gr.Markdown(
+                "### Fine-tuning — specialise the pre-trained model on your own text\n\n"
+                "**What is fine-tuning?**  The pre-trained model has already learned "
+                "general language patterns from TinyStories (~1.5 M characters). "
+                "Fine-tuning continues training from those learned weights on a small "
+                "custom corpus, so the model adapts its style, vocabulary, and topics "
+                "while retaining its general language ability.\n\n"
+                "**Why a lower learning rate?**  The model's weights are already in a "
+                "good region of parameter space. A large step (like 3e-4 used for "
+                "pre-training) would destroy that structure — the model would "
+                "'forget' general language and overfit the tiny corpus. "
+                "A smaller LR (1e-5 – 1e-4) nudges the weights gently.\n\n"
+                "**What to paste:** Any text you want the model to imitate — "
+                "a style guide, a short story, song lyrics, domain-specific prose. "
+                "Aim for **at least 500 characters** (a few paragraphs). "
+                "The tokenizer is reused from pre-training — no vocabulary changes.\n\n"
+                "**Output:** `checkpoints/finetuned.pt` — the Generate tab will "
+                "switch to this model automatically when fine-tuning finishes."
+            )
+            with gr.Row():
+                # ── Left: controls ──
+                with gr.Column(scale=1, min_width=280):
+                    ft_text = gr.Textbox(
+                        label="Custom corpus (paste your text here)",
+                        placeholder=(
+                            "Paste at least 200 characters of text here.\n\n"
+                            "Example: a short story, article, code comments, "
+                            "domain-specific prose — anything you want the model "
+                            "to learn to generate in that style."
+                        ),
+                        lines=10, max_lines=20,
+                    )
+                    ft_ckpt = gr.Textbox(
+                        label="Base checkpoint",
+                        value="checkpoints/best.pt",
+                        info="Path to the pre-trained weights to start from.",
+                    )
+                    ft_lr = gr.Slider(
+                        1e-5, 1e-4, value=5e-5, step=1e-6,
+                        label="learning_rate",
+                        info="Keep well below the pre-training LR (3e-4) to avoid catastrophic forgetting.",
+                    )
+                    ft_epochs = gr.Slider(
+                        1, 20, value=5, step=1, label="max_epochs",
+                        info="More epochs = more overfitting on small corpora. 3–5 is usually enough.",
+                    )
+                    ft_batch = gr.Slider(
+                        4, 64, value=16, step=4, label="batch_size",
+                        info="Smaller batches work better for tiny corpora; 8–16 is typical.",
+                    )
+                    with gr.Row():
+                        ft_btn  = gr.Button("Start fine-tuning", variant="primary", scale=2)
+                        ft_stop_btn = gr.Button("Stop", variant="stop", scale=1)
+                    gr.HTML("<hr style='border:none;border-top:1px solid #444;margin:8px 0'>")
+                    gr.Markdown(
+                        "<small>"
+                        "**learning_rate** — use 5e-5 as a safe default. "
+                        "Pre-training used 3e-4; going higher risks 'catastrophic forgetting' "
+                        "where the model overwrites general language ability with the new corpus.<br><br>"
+                        "**max_epochs** — with a small corpus (< 5 000 tokens) the model can overfit "
+                        "in 3–5 epochs. Watch val_loss: if it starts rising while train_loss falls, "
+                        "stop early (or reduce epochs).<br><br>"
+                        "**batch_size** — small corpus = fewer windows = smaller optimal batch. "
+                        "If you see 'not enough tokens' warnings, lower this.<br><br>"
+                        "**What changes and what doesn't** — only the weight *values* change. "
+                        "Architecture (d_model, n_layers, n_heads), tokenizer, and max_seq_len "
+                        "are all frozen at the pre-trained checkpoint's settings."
+                        "</small>"
+                    )
+                # ── Right: outputs ──
+                with gr.Column(scale=2):
+                    ft_log = gr.Textbox(
+                        label="Fine-tuning log",
+                        value="(press Start to begin)",
+                        lines=12, max_lines=20, show_copy_button=True,
+                        interactive=False,
+                    )
+                    ft_plot = gr.Image(
+                        label="Loss curve (live)", type="filepath", height=280,
+                    )
+                    gr.Markdown(
+                        "<small>Blue = training loss, orange = validation loss. "
+                        "Val loss higher than train loss is normal and expected for small corpora. "
+                        "Stop if val loss starts diverging sharply (overfitting).</small>"
+                    )
+                    ft_status = gr.Textbox(
+                        label="Status", value="idle", interactive=False,
+                    )
+                    ft_samples = gr.Textbox(
+                        label="Generation samples (newest first)",
+                        value="(samples appear here after each epoch)",
+                        lines=6, max_lines=16, interactive=False,
+                    )
+                    gr.Markdown(
+                        "<small>After each epoch the model generates from a fixed prompt using the "
+                        "fine-tuned weights. Compare early vs late epochs to see style adaptation. "
+                        "The final fine-tuned model is saved to "
+                        "`checkpoints/finetuned.pt` and loaded into the Generate tab.</small>"
+                    )
+
+            ft_btn.click(
+                ft_start,
+                inputs=[ft_text, ft_ckpt, ft_lr, ft_epochs, ft_batch],
+                outputs=[ft_status],
+            )
+            ft_stop_btn.click(ft_stop, inputs=[], outputs=[ft_status])
+            ft_timer = gr.Timer(value=2)
+            ft_timer.tick(poll_ft, outputs=[ft_log, ft_plot, ft_status, ft_samples])
+
+        with gr.Column(visible=False):
             gr.Markdown(
                 "**How does each training hyperparameter shape the loss curve?** "
                 "The plots below are schematic (synthetic data, based on the "
@@ -1408,8 +1974,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[effect_caption, effect_img],
             )
 
-        # ── Tab 4: Train Reports (step-by-step forward pass) ──
-        with gr.Tab("Train Reports"):
+        with gr.Column(visible=False) as _panel_reports:
             gr.Markdown(
                 "### 16-slide visual walkthrough of a single forward pass\n\n"
                 "Each slide reveals one stage of how the model processes your prompt — "
@@ -1427,33 +1992,26 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=1):
                     teach_prompt = gr.Textbox(
                         label="Prompt", value="The cat sat on the", lines=2,
-                        info="The text the model will process. Try short phrases to see clear patterns.",
                     )
                     teach_layer = gr.Slider(
                         0, n_layers - 1, 0, step=1, label="layer",
-                        info=f"Which transformer block (0–{n_layers-1}). Early layers capture syntax, later layers capture semantics.",
                     )
                     teach_head = gr.Slider(
                         0, n_heads - 1, 0, step=1, label="head",
-                        info=f"Which attention head (0–{n_heads-1}). Each head learns to attend to different token relationships.",
                     )
                     teach_qpos = gr.Number(
                         value=-1, precision=0,
                         label="query_pos (-1 = last token)",
-                        info="Which token position is 'asking the question'. -1 means the last token (most common for generation).",
                     )
                     with gr.Row():
                         teach_temp = gr.Slider(
                             0.05, 2.0, 0.8, step=0.05, label="temp",
-                            info="Sampling temperature. Lower = more deterministic, higher = more creative.",
                         )
                         teach_topk = gr.Slider(
                             0, 200, 40, step=1, label="top_k",
-                            info="Only consider the top-k most likely tokens. 0 = disabled.",
                         )
                         teach_topp = gr.Slider(
                             0.05, 1.0, 0.9, step=0.05, label="top_p",
-                            info="Nucleus sampling: keep tokens until cumulative probability reaches top_p.",
                         )
                     teach_btn = gr.Button("Render 16 slides", variant="primary")
                     with gr.Row():
@@ -1471,7 +2029,17 @@ def build_ui() -> gr.Blocks:
                         label="Current", columns=2, height=700,
                         show_label=True, object_fit="contain",
                     )
-
+                    gr.Markdown(
+                        "<small>"
+                        "**Prompt** — text the model processes; short phrases (5–10 tokens) give the clearest slides.<br>"
+                        f"**layer** — which transformer block (0–{n_layers-1}); early layers capture syntax, later layers capture semantics.<br>"
+                        f"**head** — which attention head (0–{n_heads-1}); each head learns to attend to different token relationships.<br>"
+                        "**query_pos** — which token is 'asking the question'; −1 = last token (most common for generation).<br>"
+                        "**temp** — sampling temperature; lower = more deterministic, higher = more creative.<br>"
+                        "**top_k** — only consider the top-k most likely tokens at each step; 0 = disabled.<br>"
+                        "**top_p** — nucleus sampling: keep tokens until cumulative probability reaches top_p."
+                        "</small>"
+                    )
             def _render_and_track(*args):
                 global _LAST_SLIDE_DIR
                 import shutil
@@ -1498,7 +2066,7 @@ def build_ui() -> gr.Blocks:
                 return (
                     gr.update(value=current_gallery, visible=True),
                     gr.update(value=f"**Pinned:** {_PINNED_LABEL}", visible=True),
-                    gr.update(value=700, height=350),  # shrink current gallery
+                    gr.update(height=350),
                 )
 
             teach_pin_btn.click(
@@ -1523,8 +2091,80 @@ def build_ui() -> gr.Blocks:
                 outputs=[teach_dl_file],
             )
 
-        # ── Tab 5: Attention (per-head heatmaps) ──
-        with gr.Tab("Attention"):
+            with gr.Accordion("Slide guide — what each of the 16 slides shows", open=True):
+                gr.Markdown(
+                    "**01 — Tokenization** · The prompt is encoded to UTF-8 bytes, then BPE merges reduce it to "
+                    "fewer tokens. Three rows show: original characters → hex bytes → final token IDs. "
+                    "Green tokens are BPE merges (learned); red tokens are raw single bytes. "
+                    "The compression ratio tells you how efficiently the vocabulary represents your text.\n\n"
+                    "**02 — Token embeddings** · Each token ID is looked up in the embedding table to produce "
+                    "a `d_model`-dimensional vector (heatmap, first 32 dims shown). "
+                    "The colour pattern reflects how similar tokens cluster together in embedding space — "
+                    "words with similar meanings get similar vectors through training.\n\n"
+                    "**03 — Q, K, V projections** · The embedding of each token is linearly projected three "
+                    "times to produce Query, Key, and Value vectors for the selected head. "
+                    "Q asks *what am I looking for?*, K announces *what do I contain?*, V carries *what I'll pass on*. "
+                    "Each is `d_head`-dimensional; the heatmap uses the same colour scale for easy comparison.\n\n"
+                    "**04 — Attention scores (raw)** · Pairwise dot products: `Q · Kᵀ / √d_head`. "
+                    "Entry (i, j) measures how relevant token j is to token i. "
+                    "The full matrix is shown *before* masking — notice the upper triangle is still visible. "
+                    "High positive scores (dark blue) mean strong relevance.\n\n"
+                    "**05 — Causal mask applied** · The upper triangle is set to −∞ so token i cannot "
+                    "attend to any future token j > i. Grey cells are the masked positions. "
+                    "This is what makes the model autoregressive: it can only use past context to "
+                    "predict the next token.\n\n"
+                    "**06 — Attention weights (softmax)** · After softmax, each row sums to 1 — it is now "
+                    "a probability distribution over past tokens. The `*` marks the token each query "
+                    "attends to most strongly. A uniform row means the head is uncertain; "
+                    "a sharp row means it found a clear signal.\n\n"
+                    "**07 — Weighted value sum** · For the selected query position (token i), the bar chart "
+                    "shows how much weight it gave each past token. The heatmap below shows each V row "
+                    "followed by the computed output = Σⱼ w_ij · V[j]. "
+                    "This is the actual output of the attention head for that one token position.\n\n"
+                    "**08 — All heads side by side** · Every attention head in the chosen layer at once. "
+                    "Different heads typically specialise: one may copy the previous token, another may "
+                    "track subject-verb agreement, another may link pronouns to their referents. "
+                    "Diversity across heads is healthy — uniform heads suggest redundancy.\n\n"
+                    "**09 — FFN delta (before / delta / after)** · After attention, the feed-forward network "
+                    "processes each token independently. The three heatmaps show the hidden state entering "
+                    "the FFN, the change the FFN adds (the *delta*), and the state after. "
+                    "The delta panel shows which dimensions the FFN actively modifies — "
+                    "this is where factual knowledge is believed to be stored.\n\n"
+                    "**10 — Next-token distribution (top 20)** · The model's final prediction for what comes "
+                    "next. Blue bars are the raw softmax probabilities; orange bars show what remains after "
+                    "temperature scaling + top-k + top-p filtering. "
+                    "A well-trained model concentrates probability on semantically plausible continuations.\n\n"
+                    "**11 — Sampling rollout (10 steps)** · Ten decode steps shown as a grid. "
+                    "Each column is one step; each row is one of the top-5 candidates with its probability. "
+                    "The orange highlighted cell is the token that was actually chosen. "
+                    "Watch how probabilities shift as context accumulates.\n\n"
+                    "**12 — RoPE positional encoding** · Left: the cos/sin frequency tables — each column "
+                    "oscillates at a different frequency, so every position gets a unique fingerprint. "
+                    "Right: a unit vector rotated by increasing position shows how Q and K vectors are "
+                    "literally rotated in 2D pairs. Low-frequency pairs rotate slowly (long-range), "
+                    "high-frequency pairs rotate fast (short-range).\n\n"
+                    "**13 — Why divide by √d_head?** · Without the scaling, Q·Kᵀ dot products grow in "
+                    "magnitude with dimensionality, pushing softmax toward a one-hot distribution "
+                    "(near-zero gradients = dead attention). "
+                    "The grid compares unscaled vs scaled softmax at d = 8 / 64 / 256 / 1024 — "
+                    "the top row saturates while the bottom row stays diffuse.\n\n"
+                    "**14 — Temperature effect** · The same logits fed to softmax at T = 0.3 / 1.0 / 2.0. "
+                    "T < 1 sharpens the distribution (model becomes confident, repetitive). "
+                    "T = 1 is the raw distribution. "
+                    "T > 1 flattens it (more creative but also more incoherent).\n\n"
+                    "**15 — Greedy vs sampling** · Three decoded continuations from the same prompt: "
+                    "greedy (always pick argmax, T ≈ 0), temperature-1 sampling (top-k=40, top-p=0.9), "
+                    "and hot sampling (T=1.5, top-p=0.95). "
+                    "Greedy output is often repetitive; hot sampling can be incoherent. "
+                    "The middle setting is usually the best balance for story-like text.\n\n"
+                    "**16 — Parameter breakdown** · Pie chart of where the 12M parameters live. "
+                    "Token embedding / lm_head (weight-tied) and FFN layers dominate. "
+                    "RMSNorm has almost none — it is cheap. "
+                    "This explains why making the model wider (`d_model`) or deeper (more layers) "
+                    "grows the FFN and QKV blocks fastest."
+                )
+
+        with gr.Column(visible=False) as _panel_attn:
             gr.Markdown(
                 "### Attention heatmaps — what tokens attend to what\n\n"
                 "Self-attention is the core mechanism that lets each token 'look at' "
@@ -1574,14 +2214,36 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         attn_head_img = gr.Image(label="Single head", type="filepath")
                         attn_rollout_img = gr.Image(label="Rollout (all layers)", type="filepath")
+                    with gr.Row():
+                        gr.Markdown(
+                            "<small><b>Single head</b> — one attention head's weight matrix "
+                            "after softmax + causal masking. "
+                            "Rows are query tokens (the token 'asking'), columns are key tokens (the token 'answering'). "
+                            "Brightness = attention weight (0–1, each row sums to 1). "
+                            "The lower-left triangle only is filled because causal masking prevents any token from "
+                            "attending to future positions. "
+                            "A head that attends uniformly across past tokens is gathering broad context; "
+                            "one that attends sharply to one token is copying or referencing it specifically. "
+                            "Change <b>layer</b> and <b>head</b> to see how different parts of the model use attention differently.</small>"
+                        )
+                        gr.Markdown(
+                            "<small><b>Rollout (all layers)</b> — attention rollout (Abnar & Zuidema 2020) propagates "
+                            "attention weights through every layer simultaneously to approximate the true "
+                            "information flow from input tokens to the final representation. "
+                            "Unlike the single-head view, rollout accounts for residual connections and averages "
+                            "across all heads at each layer. "
+                            "A bright entry (i, j) means token j's input was a strong contributor to token i's "
+                            "final hidden state. "
+                            "This is more meaningful than any single head for understanding which input tokens "
+                            "the model 'relied on' when building each position's representation.</small>"
+                        )
             attn_btn.click(
                 render_attention,
                 inputs=[attn_prompt, attn_layer, attn_head],
                 outputs=[attn_head_img, attn_rollout_img, attn_status],
             )
 
-        # ── Tab 6: Visualize (animated forward pass) ──
-        with gr.Tab("Visualize"):
+        with gr.Column(visible=False) as _panel_viz:
             gr.Markdown(
                 "### Animated forward pass — watch data flow through the transformer\n\n"
                 "Enter a prompt and click **Visualize** to see a synchronized animation of:\n"
@@ -1605,8 +2267,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[viz_html],
             )
 
-        # ── Tab 7: Generate (interactive text generation) ──
-        with gr.Tab("Generate"):
+        with gr.Column(visible=False) as _panel_gen:
             gr.Markdown(
                 "### Interactive text generation\n\n"
                 "The model predicts one token at a time, appending each prediction to "
@@ -1624,35 +2285,39 @@ def build_ui() -> gr.Blocks:
                     gen_prompt = gr.Textbox(
                         label="Prompt", value="To be or not to be, ",
                         lines=2, max_lines=4,
-                        info="Starting text the model continues from. The model has only seen simple short stories during training.",
                     )
                     with gr.Row():
                         gen_max = gr.Slider(
                             8, max_seq - 1, 100, step=1,
                             label="max_new_tokens",
-                            info="How many tokens to generate. Longer = slower but more text. Limited by the 256-token context window.",
                         )
                     with gr.Row():
                         gen_temp = gr.Slider(
                             0.05, 2.0, 0.8, step=0.05, label="temperature",
-                            info="Scales the logits before softmax. <1 = sharper (more repetitive), >1 = flatter (more random). 0.8 is a good default.",
                         )
                         gen_topk = gr.Slider(
                             0, 200, 40, step=1, label="top_k",
-                            info="Keep only the top-k most probable tokens, zero out the rest. 0 = disabled (consider all tokens). Prevents rare gibberish.",
                         )
                         gen_topp = gr.Slider(
                             0.05, 1.0, 0.9, step=0.05, label="top_p (nucleus)",
-                            info="Keep the smallest set of tokens whose cumulative probability exceeds top_p. Adapts dynamically — broad when uncertain, narrow when confident.",
                         )
                     gen_cache = gr.Checkbox(
                         True, label="Use KV cache (generate_fast)",
-                        info="ON: reuses past K/V vectors (fast, O(T) per step). OFF: recomputes full attention each step (slow, O(T²)) — educational comparison.",
                     )
                     gen_btn = gr.Button("Generate", variant="primary")
                 with gr.Column(scale=3):
                     gen_out = gr.Textbox(
                         label="Output (streaming)", lines=16, show_copy_button=True,
+                    )
+                    gr.Markdown(
+                        "<small>"
+                        "**Prompt** — starting text the model continues from; it has only seen simple short stories during training.<br>"
+                        "**max_new_tokens** — how many tokens to generate; longer = slower but more text; limited by the context window.<br>"
+                        "**temperature** — scales logits before softmax; &lt;1 = sharper/more repetitive, &gt;1 = flatter/more random; 0.8 is a good default.<br>"
+                        "**top_k** — only consider the top-k most probable tokens at each step; 0 = disabled (use all tokens).<br>"
+                        "**top_p (nucleus)** — keep the smallest set of tokens whose cumulative probability exceeds top_p; adapts dynamically — broad when uncertain, narrow when confident.<br>"
+                        "**KV cache** — ON: reuses past K/V vectors (fast, O(T) per step); OFF: recomputes full attention each step (slow, O(T²)) — toggle to see the educational comparison."
+                        "</small>"
                     )
             gen_btn.click(
                 generate_stream,
@@ -1660,8 +2325,7 @@ def build_ui() -> gr.Blocks:
                 outputs=gen_out,
             )
 
-        # ── Tab 8: Benchmark (cache vs no-cache comparison) ──
-        with gr.Tab("Benchmark"):
+        with gr.Column(visible=False) as _panel_bench:
             gr.Markdown(
                 "### KV cache speedup — why caching matters\n\n"
                 "Compares two generation strategies side by side:\n"
@@ -1697,8 +2361,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[bench_img, bench_summary],
             )
 
-        # ── Notebook tab: KV Cache deep dive (notebook §9) ──
-        with gr.Tab("KV Cache"):
+        with gr.Column(visible=False) as _panel_kv:
             gr.Markdown(
                 "### KV cache — equivalence proofs + length sweep\n\n"
                 "Mirrors **§9** of the notebook. The Benchmark tab measures "
@@ -1756,6 +2419,104 @@ def build_ui() -> gr.Blocks:
             "Pre-Norm · weight-tied · combined QKV · bf16-capable. "
             "Code: `model.py` (800 lines)."
         )
+
+        # ── Wire sidebar nav to panel visibility ──
+        _MERMAID_DIAGRAM = """
+flowchart TD
+    subgraph SETUP["Setup  (bash run.sh setup)"]
+        CORPUS["data/corpus.txt\\n~1.5M characters"]
+        TRAIN_TOK["BPETokenizer.train()\\n256 base bytes → 4096 vocab"]
+        TOK_JSON["tokenizer.json\\nvocab + merge rules"]
+        CORPUS --> TRAIN_TOK --> TOK_JSON
+    end
+
+    subgraph TOKENISE["Tokenisation  (train.py)"]
+        ENCODE["tokenizer.encode(corpus)\\nprogress every 5%"]
+        CACHE["tokens_HASH.npy\\ndisk cache — skipped on 2nd run"]
+        SPLIT["90 / 10 split\\ntrain_tokens · val_tokens"]
+        DATASET["TextDataset\\nsliding windows, stride = seq_len/2"]
+        LOADER["DataLoader\\nbatch → (input_ids, targets)\\ntargets = input shifted +1"]
+        ENCODE --> CACHE --> SPLIT --> DATASET --> LOADER
+    end
+
+    subgraph MODEL["NanoLLM forward pass  (model.py)"]
+        EMBTOK["token_emb\\ntoken ID → d_model vector"]
+        subgraph BLOCK["× n_layers  TransformerBlock"]
+            RMS1["RMSNorm"] --> ATTN["CausalSelfAttention\\nQKV · RoPE · scores/√d\\ncausal mask · softmax · out proj"]
+            ATTN --> RES1["residual add"] --> RMS2["RMSNorm"]
+            RMS2 --> FFN["SwiGLU FFN\\ngate · up → silu → down"]
+            FFN --> RES2["residual add"]
+        end
+        LMHEAD["lm_head  (weight-tied to token_emb)\\nhidden → vocab logits"]
+        LOSS["cross_entropy_loss\\nlogits vs targets"]
+        EMBTOK --> BLOCK --> LMHEAD --> LOSS
+    end
+
+    subgraph TRAIN["Training loop  (train.py)"]
+        AMP["AMP autocast  bf16/CUDA"]
+        BACK["loss.backward()"]
+        CLIP["clip_grad_norm"]
+        OPT["AdamW step\\n+ cosine LR schedule"]
+        CKPT["checkpoints/\\nepoch_NNN.pt · best.pt"]
+        CURVE["loss_curve.png"]
+        AMP --> BACK --> CLIP --> OPT --> CKPT
+        OPT --> CURVE
+    end
+
+    subgraph INFER["Inference  (generate.py / model.py)"]
+        GEN["generate()\\nno KV cache"]
+        GENF["generate_fast()\\nKV cache — new token only"]
+        SAMPLE["_sample_from_logits()\\ntemperature · top-k · top-p"]
+        DECODE["tokenizer.decode()\\ntoken IDs → UTF-8 text"]
+        GEN --> SAMPLE --> DECODE
+        GENF --> SAMPLE
+    end
+
+    subgraph UI["Gradio UI  (app.py)"]
+        T1["Tokenizer · Dataset · TransformerBlock"]
+        T2["Train · Train Reports"]
+        T3["Attention · Visualize"]
+        T4["Generate · Benchmark · KV Cache"]
+    end
+
+    TOK_JSON --> TOKENISE
+    LOADER --> MODEL
+    LOSS --> TRAIN
+    CKPT --> INFER
+    CKPT --> UI
+    TOK_JSON --> UI
+    INFER --> UI
+"""
+
+        with gr.Column(visible=False) as _panel_arch:
+            gr.Markdown("### End-to-end architecture flow")
+            gr.HTML(f"""
+<div style="overflow:auto; padding:16px;">
+  <pre class="mermaid" style="background:transparent;">
+{_MERMAID_DIAGRAM}
+  </pre>
+</div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({{
+    startOnLoad: true,
+    theme: 'dark',
+    flowchart: {{ curve: 'basis', padding: 20 }}
+  }});
+  mermaid.run();
+</script>
+""")
+
+        _all_panels = [
+            _panel_tokenizer, _panel_dataset, _panel_tb, _panel_train,
+            _panel_finetune, _panel_reports, _panel_attn, _panel_viz, _panel_gen,
+            _panel_bench, _panel_kv, _panel_arch,
+        ]
+
+        def _switch_panel(choice):
+            return [gr.update(visible=(name == choice)) for name in _NAV_CHOICES]
+
+        _nav.change(_switch_panel, inputs=_nav, outputs=_all_panels)
 
     return demo
 

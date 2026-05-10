@@ -392,6 +392,103 @@ Equivalence verified by `test_kv_cache_matches_full_pass` (max |Δlogit| < 1e-4)
 | Output projection | **Weight-tied** with embedding | Separate weights |
 | Attention projection | **Combined QKV** | Separate Q, K, V |
 
+### End-to-end system — from corpus to generation
+
+```mermaid
+---
+config:
+  layout: elk
+---
+flowchart BT
+ subgraph SETUP["Setup  (bash run.sh setup)"]
+        CORPUS["data/corpus.txt\n~1.5M characters"]
+        TRAIN_TOK["BPETokenizer.train()\n256 base bytes → 4096 vocab"]
+        TOK_JSON["tokenizer.json\nvocab + merge rules"]
+  end
+ subgraph TOKENISE["Tokenisation  (train.py)"]
+        ENCODE["tokenizer.encode(corpus)\n progress_cb every 5%"]
+        CACHE["tokens_HASH.npy\ndisk cache — skipped on 2nd run"]
+        SPLIT["90 / 10 split\ntrain_tokens · val_tokens"]
+        DATASET["TextDataset\nsliding windows, stride = seq_len/2"]
+        LOADER["DataLoader\nbatch → (input_ids, targets)\ntargets = input shifted +1"]
+  end
+ subgraph BLOCK["One TransformerBlock"]
+        RMS1["RMSNorm"]
+        ATTN["CausalSelfAttention\nQKV proj → RoPE → scores/√d\n→ causal mask → softmax → out proj"]
+        RES1["residual add"]
+        RMS2["RMSNorm"]
+        FFN["SwiGLU FFN\ngate_proj · up_proj → silu → down_proj"]
+        RES2["residual add"]
+  end
+ subgraph MODEL["NanoLLM forward pass  (model.py)"]
+        EMBTOK["token_emb\ntoken ID → d_model vector"]
+        BLOCKS["× n_layers  TransformerBlock"]
+        BLOCK
+        LMHEAD["lm_head  (weight-tied to token_emb)\nhidden → vocab logits"]
+        LOSS["cross_entropy_loss\n(logits vs targets)"]
+  end
+ subgraph TRAIN["Training loop  (train.py)"]
+        AMP["AMP autocast\nbf16 on CUDA"]
+        BACK["loss.backward()"]
+        CLIP["grad_clip\nclip_grad_norm"]
+        OPT["AdamW step\n+ cosine LR schedule"]
+        CKPT["checkpoints/\nepoch_NNN.pt · best.pt"]
+        CURVE["loss_curve.png"]
+  end
+ subgraph INFER["Inference  (generate.py / model.py)"]
+        GEN["generate()\nno KV cache\nteacher-forcing style"]
+        GENF["generate_fast()\nKV cache — only last token\nper step"]
+        SAMPLE["_sample_from_logits()\ntemperature · top-k · top-p"]
+        DECODE["tokenizer.decode()\ntoken IDs → UTF-8 text"]
+  end
+ subgraph UI["Gradio UI  (app.py)  bash run.sh ui"]
+        T1["Tokenizer tab\nBPE encode/decode demo"]
+        T2["Dataset tab\nsliding-window visualiser"]
+        T3["TransformerBlock tab\nRMSNorm · RoPE · Attn · FFN sub-tabs"]
+        T4["Train tab\nstart · stop · restart\nlive loss curve + samples"]
+        T5["Train Reports tab\n16-slide forward-pass walkthrough"]
+        T6["Attention tab\nsingle-head heatmap + rollout"]
+        T7["Visualize tab\nanimated 3-panel hidden-state view"]
+        T8["Generate tab\ntoken-by-token streaming"]
+        T9["Benchmark tab\ngenerate vs generate_fast tok/s"]
+        T10["KV Cache tab\nequivalence + length-sweep timing"]
+  end
+    CORPUS --> TRAIN_TOK
+    TRAIN_TOK --> TOK_JSON
+    ENCODE --> CACHE
+    CACHE --> SPLIT
+    SPLIT --> DATASET
+    DATASET --> LOADER
+    RMS1 --> ATTN
+    ATTN --> RES1
+    RES1 --> RMS2
+    RMS2 --> FFN
+    FFN --> RES2
+    EMBTOK --> BLOCKS
+    BLOCKS --> LMHEAD
+    LMHEAD --> LOSS
+    AMP --> BACK
+    BACK --> CLIP
+    CLIP --> OPT
+    OPT --> CKPT & CURVE
+    GEN --> SAMPLE
+    SAMPLE --> DECODE
+    GENF --> SAMPLE
+    TOK_JSON --> TOKENISE & UI
+    LOADER --> MODEL
+    LOSS --> TRAIN
+    CKPT --> INFER & UI
+    INFER --> UI
+
+    style TOKENISE fill:#1a4a2e,color:#fff
+    style MODEL fill:#3d1a4a,color:#fff
+    style TRAIN fill:#4a2a1a,color:#fff
+    style INFER fill:#1a3a4a,color:#fff
+    style UI fill:#2a3a1a,color:#fff
+    style SETUP fill:#1e3a5f,color:#fff
+    style BLOCK fill:#2d1040,color:#fff
+```
+
 ## Web UI
 
 `bash run.sh ui` launches a Gradio console with 6 tabs:
